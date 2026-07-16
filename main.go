@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -58,6 +59,7 @@ type SSHClient struct {
 
 // ServerManager 管理多个 SSH 连接
 type ServerManager struct {
+	mu      sync.RWMutex
 	configs map[string]SSHConfig
 	clients map[string]*SSHClient
 }
@@ -72,10 +74,13 @@ func NewServerManager(cfg Config) *ServerManager {
 	}
 }
 
-// GetClient 获取或创建 SSH 连接（单例模式）
+// GetClient 获取或创建 SSH 连接（单例模式，并发安全）
 func (sm *ServerManager) GetClient(name string) (*SSHClient, error) {
-	// 如果已有缓存的连接，直接返回
-	if client, ok := sm.clients[name]; ok {
+	// 快速路径：已有缓存连接，直接返回（读锁，并发安全）
+	sm.mu.RLock()
+	client, ok := sm.clients[name]
+	sm.mu.RUnlock()
+	if ok {
 		return client, nil
 	}
 
@@ -115,14 +120,19 @@ func (sm *ServerManager) GetClient(name string) (*SSHClient, error) {
 
 	// 创建客户端实例
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	client := &SSHClient{
+	newClient := &SSHClient{
 		config: sshConfig,
 		addr:   addr,
 	}
 
-	// 缓存连接（惰性初始化）
-	sm.clients[name] = client
-	return client, nil
+	// 写锁 + 双重检查：避免并发 map 写入与重复建连
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if client, ok := sm.clients[name]; ok {
+		return client, nil
+	}
+	sm.clients[name] = newClient
+	return newClient, nil
 }
 
 // RunCommand 在远程服务器上执行命令
@@ -273,7 +283,7 @@ func handleReadConfigFile(sm *ServerManager) func(ctx context.Context, req mcp.C
 
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("读取文件失败: %w", err)), nil
+			return mcp.NewToolResultError(fmt.Sprintf("读取文件失败: %v", err)), nil
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("文件内容:\n%s", string(data))), nil
