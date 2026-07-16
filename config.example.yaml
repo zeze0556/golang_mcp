@@ -1,0 +1,65 @@
+# ============================================
+# Multi-SSH MCP Server 配置模板
+# ============================================
+# 使用方法：复制本文件为 config.yaml 后填入你自己的值
+#   cp config.example.yaml config.yaml
+# 注意：config.yaml 已加入 .gitignore，不会被提交到代码仓库。
+
+# 传输模式: "stdio" (默认, 适合 Claude Desktop) 或 "http" (适合网页前端 / nginx 反代)
+transport: "http"
+
+# HTTP 模式配置（仅当 transport=http 时生效）
+http:
+  host: "0.0.0.0"          # 监听地址，0.0.0.0 表示所有网卡
+  port: 8080               # 监听端口
+  path: "/mcp"             # MCP 端点路径，客户端连接 http://host:port/mcp
+  # CORS 跨域配置：允许网页前端（如 llama.cpp Web UI）直接调用本服务
+  # 通配所有域名：仅写 "*" 即可（自动放行 mcp-protocol-version 等任意自定义头）
+  # 公网暴露建议改为精确域名列表，如 ["https://your-frontend.com"]
+  cors_origins:
+    - "*"
+  # 若前端需要携带 Cookie/Authorization 等凭证，保持 true；
+  # 纯匿名调用可设为 false。无论 true/false，"*" 都会正确回显来源，浏览器均可接受。
+  cors_credentials: true   # 是否允许跨域携带凭证（如 Cookie / Authorization）
+
+  # 访问令牌鉴权（防止 MCP 端点被未授权访问，建议公网/反代暴露时务必开启）
+  # 客户端调用时需携带：Authorization: Bearer <token>  或  X-Access-Token: <token>
+  auth:
+    enabled: true
+    tokens:
+      # 方式 A: 直接写明文令牌（仅适合内网/临时测试，注意别提交到代码仓库）
+      # - "请改成一段足够长且随机的令牌，例如 openssl rand -hex 32 生成的"
+      # 方式 B: 从环境变量读取，避免明文落盘（推荐）。启动时先 export MCP_ACCESS_TOKEN=xxx
+      - "${MCP_ACCESS_TOKEN}"
+      # 可配置多个令牌，便于轮换/为不同客户端签发不同令牌
+
+# ============================================
+# 远程服务器清单（支持任意数量）
+# ============================================
+servers:
+  # 场景 1: 使用本地私钥文件
+  web-frontend:
+    host: "192.168.1.21"        # 改为你的真实服务器 IP 或域名
+    port: 22
+    user: "root"                # 改为你的 SSH 用户名
+    key_path: "C:/Users/YourName/.ssh/id_ed25519"  # 改为你的私钥路径（Windows 用正斜杠）
+    description: "前端应用服务器，运行 Nginx + Node.js"
+
+  # 场景 2: 直接粘贴私钥内容（适合容器化部署）
+  database-master:
+    host: "192.168.1.20"
+    port: 22
+    user: "admin"
+    key_content: |
+      -----BEGIN OPENSSH PRIVATE KEY-----
+      你的私钥内容...
+      -----END OPENSSH PRIVATE KEY-----
+    description: "主数据库服务器"
+
+  # 场景 3: 本地开发机（Docker 端口映射）
+  local-dev:
+    host: "127.0.0.1"
+    port: 2222
+    user: "dev"
+    key_path: "C:/Users/YourName/.ssh/test_key"
+    description: "本地测试环境"

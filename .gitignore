@@ -1,0 +1,33 @@
+# ============ 编译产物 / 二进制 ============
+*.exe
+ssh-mcp-server
+ssh-mcp-server.exe
+*.test
+
+# ============ 本地配置（含敏感信息：access_token、服务器 IP、私钥路径）============
+# 仅提交 config.example.yaml 作为模板，真实配置请保留在本地 config.yaml
+config.yaml
+
+# ============ 密钥 / 凭证 ============
+# 注意：openclaw 是一个真实的 OpenSSH 私钥，切勿提交！
+*.pem
+*.key
+*.ed25519
+*.rsa
+id_*
+openclaw
+known_hosts
+authorized_keys
+
+# ============ 旧方案遗留（已弃用，且可能含密钥）============
+.env
+.env.example
+
+# ============ 内部工作目录 ============
+.workbuddy/
+
+# ============ 系统 / 编辑器 ============
+.DS_Store
+Thumbs.db
+*.swp
+*~
