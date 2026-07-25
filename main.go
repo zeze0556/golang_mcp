@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
@@ -260,9 +261,13 @@ func handleWriteFile(sm *ServerManager) func(ctx context.Context, req mcp.CallTo
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// 使用 Heredoc 方式写入，处理单引号防止 Shell 注入
-		escapedContent := strings.ReplaceAll(content, "'", "'\\''")
-		writeCmd := fmt.Sprintf("cat << 'MCP_EOF' > %q\n%s\nMCP_EOF", path, escapedContent)
+		// 写入远程文件：先将内容 base64 编码，再经带引号 heredoc 写入。
+		// 这样内容与命令彻底解耦——base64 仅含 [A-Za-z0-9+/=]，远端 shell 不会对其中
+		// 任何单引号/双引号/反斜杠/$/反引号做解析，既杜绝命令注入，也避免内容被污染。
+		// 注意：带引号分隔符的 heredoc 已将中间内容视作字面量，旧实现在此之上又对单引号
+		// 做 '\'' 替换（strings.ReplaceAll）属于多余且破坏性操作，会把文件里的 ' 变成 '\''。
+		encoded := base64.StdEncoding.EncodeToString([]byte(content))
+		writeCmd := fmt.Sprintf("base64 -d > %q <<'MCP_EOF'\n%s\nMCP_EOF", path, encoded)
 
 		_, err = client.RunCommand(writeCmd)
 		if err != nil {
