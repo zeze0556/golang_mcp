@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -222,18 +225,52 @@ func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToo
 			return mcp.NewToolResultError("参数 'path' 是必填项（文件绝对路径）"), nil
 		}
 
+		offset := req.GetInt("offset", 0)
+		limit := req.GetInt("limit", 0)
+		if offset < 0 {
+			offset = 0
+		}
+		if limit < 0 {
+			limit = 0
+		}
+
 		client, err := sm.GetClient(serverName)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// 使用 cat 命令读取文件内容
-		output, err := client.RunCommand(fmt.Sprintf("cat %q", path))
+		// 1) 查文件大小，用于大文件闸门
+		const maxNoLimit = 2 * 1024 * 1024 // 2MB：未指定 limit 时允许直接读取的上限
+		size := int64(0)
+		if sizeOut, serr := client.RunCommand(fmt.Sprintf("stat -c %%s %q 2>/dev/null || wc -c < %q", path, path)); serr == nil {
+			if n, perr := strconv.ParseInt(strings.TrimSpace(sizeOut), 10, 64); perr == nil {
+				size = n
+			}
+		}
+		if limit == 0 && size > maxNoLimit {
+			return mcp.NewToolResultError(fmt.Sprintf("文件过大（约 %.1f MB），超过单次读取上限。请使用 offset/limit 分段读取，或改用 scp/sftp 传输大文件", float64(size)/float64(1024*1024))), nil
+		}
+
+		// 2) 分段读取：服务端用 tail|head 切片，整文件不进内存
+		start := offset + 1 // tail -c +K 从 1 开始计数
+		var readCmd string
+		if limit > 0 {
+			readCmd = fmt.Sprintf("tail -c +%d %q | head -c %d", start, path, limit)
+		} else {
+			readCmd = fmt.Sprintf("tail -c +%d %q", start, path)
+		}
+		output, err := client.RunCommand(readCmd)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		return mcp.NewToolResultText(fmt.Sprintf("[文件读取 - 服务器: %s]\n路径: %s\n\n内容:\n%s", serverName, path, output)), nil
+		// 3) 二进制降级：含非法 UTF-8 时 base64 返回，防止 JSON 序列化损坏
+		if !utf8.ValidString(output) {
+			b64 := base64.StdEncoding.EncodeToString([]byte(output))
+			return mcp.NewToolResultText(fmt.Sprintf("[文件读取 - 二进制/base64]\n服务器: %s\n路径: %s\n偏移: %d\n字节数: %d\n\n%s", serverName, path, offset, len(output), b64)), nil
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("[文件读取 - 服务器: %s]\n路径: %s\n偏移: %d\n字节数: %d\n\n内容:\n%s", serverName, path, offset, len(output), output)), nil
 	}
 }
 
@@ -255,14 +292,23 @@ func handleWriteFile(sm *ServerManager) func(ctx context.Context, req mcp.CallTo
 			return mcp.NewToolResultError("参数 'content' 是必填项（要写入的内容）"), nil
 		}
 
+		const maxWrite = 5 * 1024 * 1024 // 5MB：单条调用写入上限
+		if len(content) > maxWrite {
+			return mcp.NewToolResultError(fmt.Sprintf("写入内容过大（约 %.1f MB），超过单条调用上限。请改用 scp/sftp 传输大文件，或分块写入", float64(len(content))/float64(1024*1024))), nil
+		}
+
 		client, err := sm.GetClient(serverName)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// 使用 Heredoc 方式写入，处理单引号防止 Shell 注入
-		escapedContent := strings.ReplaceAll(content, "'", "'\\''")
-		writeCmd := fmt.Sprintf("cat << 'MCP_EOF' > %q\n%s\nMCP_EOF", path, escapedContent)
+		// 写入远程文件：先将内容 base64 编码，再经带引号 heredoc 写入。
+		// 这样内容与命令彻底解耦——base64 仅含 [A-Za-z0-9+/=]，远端 shell 不会对其中
+		// 任何单引号/双引号/反斜杠/$/反引号做解析，既杜绝命令注入，也避免内容被污染。
+		// 注意：带引号分隔符的 heredoc 已将中间内容视作字面量，旧实现在此之上又对单引号
+		// 做 '\'' 替换（strings.ReplaceAll）属于多余且破坏性操作，会把文件里的 ' 变成 '\''。
+		encoded := base64.StdEncoding.EncodeToString([]byte(content))
+		writeCmd := fmt.Sprintf("base64 -d > %q <<'MCP_EOF'\n%s\nMCP_EOF", path, encoded)
 
 		_, err = client.RunCommand(writeCmd)
 		if err != nil {
@@ -337,6 +383,8 @@ func main() {
 		mcp.WithDescription("从指定的远程服务器读取文件内容"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件的绝对路径")),
+		mcp.WithNumber("offset", mcp.Description("起始字节偏移（默认 0，从头开始）")),
+		mcp.WithNumber("limit", mcp.Description("读取的最大字节数（默认 0，读到文件末尾）")),
 	), handleReadFile(sm))
 
 	// 工具 4: 写入远程文件
