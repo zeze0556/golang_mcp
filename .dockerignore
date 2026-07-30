@@ -1,0 +1,36 @@
+# ============ 编译产物 / 二进制 ============
+*.exe
+ssh-mcp-server
+ssh-mcp-server.exe
+*.test
+
+# ============ 本地配置（含服务器 IP、私钥路径、access_token）============
+# 绝不进入 build context，防止泄露给 Docker daemon
+config.yaml
+config.yml
+
+# ============ 真实私钥（openclaw 是 OpenSSH 私钥）============
+openclaw
+*.pem
+*.key
+*.ed25519
+*.rsa
+id_*
+known_hosts
+authorized_keys
+
+# ============ 密钥 / 环境 ============
+.env
+.env.example
+
+# ============ 运行时 / 系统目录 ============
+.git
+.workbuddy
+
+# ============ 与镜像无关的部署辅助（在宿主机使用，不进镜像）============
+fail2ban/
+README.md
+nginx-mcp.conf
+
+# 注意：保留 docker/ 目录（Dockerfile 需要 COPY docker/entrypoint.sh）
+# 保留：go.mod go.sum main.go（构建所需，已在 Dockerfile 显式 COPY）

@@ -1,0 +1,47 @@
+# ============================================================
+# Multi-SSH MCP Server —— Docker Compose 编排
+# ------------------------------------------------------------
+# 用法（在本文件所在目录 docker/ 执行）:
+#   cd docker
+#   cp .env.example .env          # 可选：填入 MCP_ACCESS_TOKEN（也可在 config.yaml 写明文令牌）
+#   docker compose up -d --build  # 构建并后台启动
+#   docker compose ps             # 查看健康状态
+#   docker compose logs -f mcp    # 看日志
+#
+# 构建上下文 = 项目根 (..)，便于访问 go.mod / main.go / config.yaml
+# 运行时把宿主机 config.yaml 只读挂载进容器 /app/config.yaml
+# ============================================================
+
+services:
+  mcp:
+    build:
+      context: ..            # 项目根目录作为构建上下文
+      dockerfile: Dockerfile # 即 docker/Dockerfile
+    image: multi-ssh-mcp:local
+    container_name: multi-ssh-mcp
+    restart: unless-stopped
+
+    # 宿主 8080 -> 容器 8080；需与 config.yaml 中 http.port 保持一致
+    ports:
+      - "8080:8080"
+
+    # 配置只读挂载，避免容器内误改
+    # 容器化部署请使用 key_content（直接贴私钥内容），不要用 key_path 的 Windows 路径
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+
+    # 访问令牌：从 docker/.env（compose 自动加载）或终端环境读取，避免明文落盘
+    # compose v2 会自动把同目录的 .env 作为变量源；也可 export MCP_ACCESS_TOKEN 后启动
+    # 若 .env 不存在或留空，仅表示不注入令牌（config.yaml 里可用明文令牌兜底）
+    # 若已在 config.yaml 用明文令牌，可删掉下面 MCP_ACCESS_TOKEN 这一行
+    environment:
+      - TZ=Asia/Shanghai
+      - MCP_ACCESS_TOKEN=${MCP_ACCESS_TOKEN}
+
+    # 与 Dockerfile 内 HEALTHCHECK 并存，便于 compose 显示状态
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
