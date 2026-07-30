@@ -22,6 +22,8 @@ authorized_keys
 # ============ 旧方案遗留（已弃用，且可能含密钥）============
 .env
 .env.example
+# 例外：docker 部署用的令牌模板需纳入版本控制（仅模板，无真实密钥）
+!docker/.env.example
 
 # ============ 内部工作目录 ============
 .workbuddy/
