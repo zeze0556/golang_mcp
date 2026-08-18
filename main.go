@@ -58,10 +58,11 @@ type Config struct {
 
 // SSHClient 封装 SSH 连接（连接池：复用单条长连接，避免每次调用都重建 SSH 握手）
 type SSHClient struct {
-	mu     sync.Mutex
-	config *ssh.ClientConfig
-	addr   string
-	client *ssh.Client // 持久连接，懒建立、可重连；nil 表示需重建
+	mu         sync.Mutex
+	config     *ssh.ClientConfig
+	addr       string
+	client     *ssh.Client  // 持久 SSH 连接，懒建立、可重连；nil 表示需重建
+	sftpClient *sftp.Client // 与 client 绑定的 SFTP 子系统句柄，随连接复用；nil 表示需重建
 }
 
 // ServerManager 管理多个 SSH 连接
@@ -168,6 +169,7 @@ func (sc *SSHClient) getConn() (*ssh.Client, error) {
 		return nil, fmt.Errorf("SSH 连接失败: %w", err)
 	}
 	sc.client = conn
+	sc.sftpClient = nil // 新连接尚未开启 SFTP；旧 sftpClient 已随旧连接失效
 	go sc.keepAliveLoop(conn) // 后台保活；连接被替换/关闭时该 goroutine 自行退出
 	return conn, nil
 }
@@ -178,6 +180,10 @@ func (sc *SSHClient) dropConn(c *ssh.Client) {
 	defer sc.mu.Unlock()
 	if sc.client == c {
 		sc.client = nil
+	}
+	if sc.sftpClient != nil {
+		_ = sc.sftpClient.Close() // 底层连接已失效，绑定的 SFTP 句柄同步回收
+		sc.sftpClient = nil
 	}
 	_ = c.Close()
 }
@@ -251,18 +257,24 @@ func (sc *SSHClient) runOnConn(conn *ssh.Client, cmd string) (string, error) {
 	return stdout.String(), nil
 }
 
-// openSFTP 在持久 SSH 连接上开启 SFTP 子系统。
-// 仅一条 channel 请求（无额外 TCP/KEX），代价远低于一次完整 SSH 握手；
-// 每次都基于当前连接新建，避免连接重连后句柄失效。
+// openSFTP 返回与当前持久 SSH 连接绑定的 SFTP 客户端。
+// 复用同一个 SFTP 子系统句柄（pkg/sftp 的 Client 内部做 multiplexing，可并发安全使用），
+// 避免每次 read/write 都重新开启 SFTP 子系统（省去每次的 subsystem 请求 + 版本握手往返）。
+// 句柄随底层 SSH 连接一起失效：getConn 重建连接、dropConn 丢弃连接时都会同步清空 sftpClient。
 func (sc *SSHClient) openSFTP() (*sftp.Client, error) {
-	conn, err := sc.getConn()
-	if err != nil {
-		return nil, err
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.client == nil {
+		return nil, fmt.Errorf("SSH 连接尚未建立")
 	}
-	scli, err := sftp.NewClient(conn)
+	if sc.sftpClient != nil {
+		return sc.sftpClient, nil // 复用已开启的句柄
+	}
+	scli, err := sftp.NewClient(sc.client)
 	if err != nil {
 		return nil, fmt.Errorf("SFTP 子系统启动失败: %w", err)
 	}
+	sc.sftpClient = scli // 懒建立后缓存，后续调用直接复用
 	return scli, nil
 }
 
@@ -348,12 +360,11 @@ func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToo
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// 复用持久 SSH 连接开启 SFTP 子系统（仅一条 channel 请求，无额外 TCP/KEX）
+		// 复用持久 SSH 连接上的 SFTP 子系统句柄（已池化，无需每次重建）
 		scli, err := client.openSFTP()
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("%v（请确认远程 sshd 已启用 sftp 子系统）", err)), nil
 		}
-		defer scli.Close()
 
 		// 打开并按需取大小（一次 sftp 调用，替代原 shell stat/wc 的额外往返）
 		f, err := scli.Open(path)
@@ -506,7 +517,6 @@ func handleWriteFile(sm *ServerManager) func(ctx context.Context, req mcp.CallTo
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("%v（请确认远程 sshd 已启用 sftp 子系统）", err)), nil
 		}
-		defer scli.Close()
 
 		// 流式分块写（内部按 4MB 切片多次 WriteAt，避免单次超大 Write 与内存尖峰）
 		written, werr := sftpWriteAll(scli, path, []byte(content), appendMode, writeOffset, 4*1024*1024)
@@ -608,7 +618,6 @@ func handleWriteFileChunked(sm *ServerManager) func(ctx context.Context, req mcp
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("%v（请确认远程 sshd 已启用 sftp 子系统）", err)), nil
 		}
-		defer scli.Close()
 
 		// 分块上传助手：自动切片写入；append 时自动定位到末尾（writeOffset=-1）
 		written, werr := sftpWriteAll(scli, path, []byte(content), appendMode, -1, chunkSize)
