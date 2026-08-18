@@ -315,7 +315,8 @@ func handleExecuteCommand(sm *ServerManager) func(ctx context.Context, req mcp.C
 	}
 }
 
-// handleReadFile 读取远程文件（SFTP 子系统：随机字节读，无 shell/base64 开销）
+// handleReadFile 读取远程文件（SFTP 子系统：随机字节读，无 shell/base64 开销）。
+// 两种分页互斥：提供 offset_lines/limit_lines 任一即进入「行号分页」，否则走「字节分页」。
 func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		serverName := req.GetString("server", "")
@@ -328,6 +329,7 @@ func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToo
 			return mcp.NewToolResultError("参数 'path' 是必填项（文件绝对路径）"), nil
 		}
 
+		// 字节分页（原语义）
 		offset := req.GetInt("offset", 0)
 		limit := req.GetInt("limit", 0)
 		if offset < 0 {
@@ -336,6 +338,10 @@ func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToo
 		if limit < 0 {
 			limit = 0
 		}
+		// 行号分页（新增）：offset_lines/limit_lines 任一 >0 即进入行模式
+		offsetLines := req.GetInt("offset_lines", 0)
+		limitLines := req.GetInt("limit_lines", 0)
+		useLineMode := offsetLines > 0 || limitLines > 0
 
 		client, err := sm.GetClient(serverName)
 		if err != nil {
@@ -349,8 +355,7 @@ func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToo
 		}
 		defer scli.Close()
 
-		// 1) 打开并按需取大小（一次 sftp 调用，替代原 shell stat/wc 的额外往返）
-		const maxReadDefault = 4 * 1024 * 1024 // 4MB：未指定 limit 时允许直接读取的上限
+		// 打开并按需取大小（一次 sftp 调用，替代原 shell stat/wc 的额外往返）
 		f, err := scli.Open(path)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("打开文件失败: %v", err)), nil
@@ -362,11 +367,17 @@ func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToo
 		}
 		size := fi.Size()
 
-		if limit == 0 && size > maxReadDefault {
-			return mcp.NewToolResultError(fmt.Sprintf("文件过大（约 %.1f MB），超过单次读取上限。请使用 offset/limit 分段读取", float64(size)/float64(1024*1024))), nil
+		if useLineMode {
+			return readFileLines(f, size, serverName, path, offsetLines, limitLines)
 		}
 
-		// 2) 计算读取窗口并随机读（ReadAt 天然支持大文件、无需整文件进内存）
+		// ===== 字节模式 =====
+		const maxReadDefault = 4 * 1024 * 1024 // 4MB：未指定 limit 时允许直接读取的上限
+		if limit == 0 && size > maxReadDefault {
+			return mcp.NewToolResultError(fmt.Sprintf("文件过大（约 %.1f MB），超过单次读取上限。请使用 offset/limit 分段读取，或使用 offset_lines/limit_lines 行号分页", float64(size)/float64(1024*1024))), nil
+		}
+
+		// 计算读取窗口并随机读（ReadAt 天然支持大文件、无需整文件进内存）
 		start := int64(offset)
 		end := size
 		if limit > 0 {
@@ -390,7 +401,7 @@ func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToo
 			return mcp.NewToolResultError(fmt.Sprintf("读取文件失败: %v", rerr)), nil
 		}
 
-		// 3) 二进制降级：含非法 UTF-8 时 base64 返回，防止 JSON 序列化损坏
+		// 二进制降级：含非法 UTF-8 时 base64 返回，防止 JSON 序列化损坏
 		if !utf8.Valid(buf) {
 			b64 := base64.StdEncoding.EncodeToString(buf)
 			return mcp.NewToolResultText(fmt.Sprintf("[文件读取 - 二进制/base64]\n服务器: %s\n路径: %s\n偏移: %d\n字节数: %d\n\n%s", serverName, path, offset, len(buf), b64)), nil
@@ -400,7 +411,61 @@ func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToo
 	}
 }
 
-// handleWriteFile 写入远程文件（SFTP 子系统：流式分块写，无 base64 膨胀、无单命令长度上限）
+// readFileLines 行号分页：受 maxLineRead 上限读入后按换行切片，返回指定行范围（1-based）。
+// 面向"很多行的文件"——模型按行思考，无需知道字节偏移即可精准取某几行。
+// 注意：行模式需把目标区段读入内存，故设 32MB 上限；GB 级大文件请用 offset/limit 字节模式。
+func readFileLines(f *sftp.File, size int64, serverName, path string, offsetLines, limitLines int) (*mcp.CallToolResult, error) {
+	const maxLineRead = 32 * 1024 * 1024 // 32MB：行模式允许读入的最大字节
+	if size > maxLineRead {
+		return mcp.NewToolResultError(fmt.Sprintf("文件过大（约 %.1f MB），行号分页不支持。请改用 offset/limit 字节分页", float64(size)/float64(1024*1024))), nil
+	}
+
+	buf := make([]byte, size)
+	m, rerr := readExactAt(f, buf, 0)
+	buf = buf[:m]
+	if rerr != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("读取文件失败: %v", rerr)), nil
+	}
+	if !utf8.Valid(buf) {
+		return mcp.NewToolResultError("文件疑似二进制内容，行号分页无效。请使用 offset/limit 字节模式读取"), nil
+	}
+
+	// 按行切分（1-based 行号），并去掉末尾换行带来的空行幻影
+	text := string(buf)
+	parts := strings.Split(text, "\n")
+	total := len(parts)
+	if total > 0 && parts[total-1] == "" && (len(text) == 0 || text[len(text)-1] == '\n') {
+		total--
+		parts = parts[:total]
+	}
+
+	// 计算返回范围
+	startIdx := offsetLines - 1
+	if startIdx < 0 {
+		startIdx = 0
+	}
+	if startIdx > total {
+		startIdx = total
+	}
+	endIdx := total
+	if limitLines > 0 {
+		endIdx = startIdx + limitLines
+		if endIdx > total {
+			endIdx = total
+		}
+	}
+	if startIdx > endIdx {
+		startIdx = endIdx
+	}
+	selected := parts[startIdx:endIdx]
+	result := strings.Join(selected, "\n")
+
+	return mcp.NewToolResultText(fmt.Sprintf("[文件读取-行号分页 服务器: %s]\n路径: %s\n总行数: %d\n返回行: %d-%d（共 %d 行）\n\n内容:\n%s",
+		serverName, path, total, startIdx+1, endIdx, endIdx-startIdx, result)), nil
+}
+
+// handleWriteFile 写入远程文件（SFTP 子系统：流式分块写，无 base64 膨胀、无单命令长度上限）。
+// 支持 append/offset 分块写大文件；单次仍受 MCP/HTTP body（nginx 10MB）约束，超请分块多调用。
 func handleWriteFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		serverName := req.GetString("server", "")
@@ -443,45 +508,123 @@ func handleWriteFile(sm *ServerManager) func(ctx context.Context, req mcp.CallTo
 		}
 		defer scli.Close()
 
-		// 覆盖默认截断；追加模式保留原内容，从指定 offset 续写（支持分块上传）
-		mode := os.O_WRONLY | os.O_CREATE
-		if !appendMode {
-			mode |= os.O_TRUNC
-		}
-		f, err := scli.OpenFile(path, mode)
-		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("打开文件失败: %v", err)), nil
-		}
-		defer f.Close()
-
-		off := writeOffset
-		if appendMode && rawOffset < 0 {
-			// offset 为负：追加到文件末尾
-			if fi, e := scli.Stat(path); e == nil {
-				off = fi.Size()
-			}
-		}
-
-		// 流式分块写（每块 4MB），避免单次超大 Write 与内存尖峰
-		const writeChunk = 4 * 1024 * 1024
-		cb := []byte(content)
-		written := 0
-		for written < len(cb) {
-			end := written + writeChunk
-			if end > len(cb) {
-				end = len(cb)
-			}
-			w, werr := f.WriteAt(cb[written:end], off+int64(written))
-			written += w
-			if werr != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("写入文件失败（已写 %d 字节）: %v", written, werr)), nil
-			}
-			if w == 0 {
-				return mcp.NewToolResultError(fmt.Sprintf("写入文件中断（已写 %d 字节，未继续）", written)), nil
-			}
+		// 流式分块写（内部按 4MB 切片多次 WriteAt，避免单次超大 Write 与内存尖峰）
+		written, werr := sftpWriteAll(scli, path, []byte(content), appendMode, writeOffset, 4*1024*1024)
+		if werr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("写入文件失败（已写 %d 字节）: %v", written, werr)), nil
 		}
 
 		return mcp.NewToolResultText(fmt.Sprintf("成功写入文件\n服务器: %s\n路径: %s\n模式: %s\n大小: %d 字节", serverName, path, modeDesc(appendMode), written)), nil
+	}
+}
+
+// sftpWriteAll 通过 SFTP 把 data 分块流式写入 path：覆盖或追加，按 chunkSize 切片多次 WriteAt，
+// 避免单次超大 Write 与内存尖峰。writeOffset<0 且 append 时追加到文件末尾；非 append 时从 0 开始。
+func sftpWriteAll(scli *sftp.Client, path string, data []byte, appendMode bool, writeOffset int64, chunkSize int) (int, error) {
+	mode := os.O_WRONLY | os.O_CREATE
+	if !appendMode {
+		mode |= os.O_TRUNC
+	}
+	f, err := scli.OpenFile(path, mode)
+	if err != nil {
+		return 0, fmt.Errorf("打开文件失败: %w", err)
+	}
+	defer f.Close()
+
+	off := writeOffset
+	if appendMode {
+		if writeOffset < 0 {
+			if fi, e := scli.Stat(path); e == nil {
+				off = fi.Size()
+			} else {
+				off = 0
+			}
+		}
+	} else if off < 0 {
+		off = 0
+	}
+
+	if chunkSize <= 0 {
+		chunkSize = 4 * 1024 * 1024
+	}
+	written := 0
+	for written < len(data) {
+		end := written + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		w, werr := f.WriteAt(data[written:end], off+int64(written))
+		written += w
+		if werr != nil {
+			return written, fmt.Errorf("写入中断（已写 %d 字节）: %w", written, werr)
+		}
+		if w == 0 {
+			return written, fmt.Errorf("写入中断（已写 %d 字节，未继续）", written)
+		}
+	}
+	return written, nil
+}
+
+// handleWriteFileChunked 分块上传助手：调用方传入完整 content，工具内部按 chunk_size
+// 自动切片并以 SFTP WriteAt 落盘（调用方无需计算偏移）。支持 append 模式以支撑跨多次调用
+// 上传超过单次 MCP/HTTP body（nginx 10MB）限制的大文件：首调用 append=false 覆盖，后续
+// append=true 续写（本工具在 append 时自动定位到文件末尾，无需调用方算偏移）。
+func handleWriteFileChunked(sm *ServerManager) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		serverName := req.GetString("server", "")
+		if serverName == "" {
+			return mcp.NewToolResultError("参数 'server' 是必填项"), nil
+		}
+
+		path := req.GetString("path", "")
+		if path == "" {
+			return mcp.NewToolResultError("参数 'path' 是必填项（文件绝对路径）"), nil
+		}
+
+		content := req.GetString("content", "")
+		if content == "" {
+			return mcp.NewToolResultError("参数 'content' 是必填项（要写入的内容）"), nil
+		}
+
+		appendMode := req.GetBool("append", false)
+		chunkSize := req.GetInt("chunk_size", 0)
+		if chunkSize < 0 {
+			chunkSize = 0
+		}
+
+		// 单次调用 content 仍受 MCP/HTTP body（nginx 10MB）约束；超出请拆成多块多次调用，
+		// 首块 append=false，后续 append=true。
+		const maxWrite = 8 * 1024 * 1024
+		if len(content) > maxWrite {
+			return mcp.NewToolResultError(fmt.Sprintf("单次 content 过大（约 %.1f MB），超过上限。请拆分为多块多次调用：首块 append=false，后续 append=true", float64(len(content))/float64(1024*1024))), nil
+		}
+
+		client, err := sm.GetClient(serverName)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		scli, err := client.openSFTP()
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("%v（请确认远程 sshd 已启用 sftp 子系统）", err)), nil
+		}
+		defer scli.Close()
+
+		// 分块上传助手：自动切片写入；append 时自动定位到末尾（writeOffset=-1）
+		written, werr := sftpWriteAll(scli, path, []byte(content), appendMode, -1, chunkSize)
+		if werr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("分块写入失败: %v", werr)), nil
+		}
+
+		// 回执给出续写所需的偏移提示（append 时即当前文件总大小）
+		nextOffset := int64(written)
+		if appendMode {
+			if fi, e := scli.Stat(path); e == nil {
+				nextOffset = fi.Size()
+			}
+		}
+		return mcp.NewToolResultText(fmt.Sprintf("成功分块写入文件\n服务器: %s\n路径: %s\n模式: %s\n本次写入: %d 字节\n下次续写偏移(append): %d",
+			serverName, path, modeDesc(appendMode), written, nextOffset)), nil
 	}
 }
 
@@ -573,11 +716,13 @@ func main() {
 
 	// 工具 3: 读取远程文件
 	mcpServer.AddTool(mcp.NewTool("read_file",
-		mcp.WithDescription("通过 SFTP 子系统从指定的远程服务器读取文件内容（支持 offset/limit 字节分页）"),
+		mcp.WithDescription("通过 SFTP 子系统从指定的远程服务器读取文件内容。提供 offset_lines/limit_lines 即进入行号分页（按行读取，无需算字节偏移）；否则走 offset/limit 字节分页"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件的绝对路径")),
-		mcp.WithNumber("offset", mcp.Description("起始字节偏移（默认 0，从头开始）")),
-		mcp.WithNumber("limit", mcp.Description("读取的最大字节数（默认 0，读到文件末尾）")),
+		mcp.WithNumber("offset", mcp.Description("起始字节偏移（默认 0，从头开始）；与行号分页互斥")),
+		mcp.WithNumber("limit", mcp.Description("读取的最大字节数（默认 0，读到文件末尾）；与行号分页互斥")),
+		mcp.WithNumber("offset_lines", mcp.Description("起始行号（1-based，默认 1 从头）；提供即进入行号分页")),
+		mcp.WithNumber("limit_lines", mcp.Description("读取的最大行数（默认 0 读到末尾）；提供即进入行号分页")),
 	), handleReadFile(sm))
 
 	// 工具 4: 写入远程文件
@@ -589,6 +734,16 @@ func main() {
 		mcp.WithBoolean("append", mcp.Description("追加模式：不截断原文件，从 offset 处续写（用于分块写大文件）。默认 false=覆盖")),
 		mcp.WithNumber("offset", mcp.Description("写入起始字节偏移（配合 append 使用）；为负表示追加到文件末尾。默认 0")),
 	), handleWriteFile(sm))
+
+	// 工具 4b: 分块上传助手
+	mcpServer.AddTool(mcp.NewTool("write_file_chunked",
+		mcp.WithDescription("分块上传助手：传入完整 content，工具内部自动按 chunk_size 切片并以 SFTP WriteAt 落盘（调用方无需计算偏移）。支持 append 模式以跨多次调用上传超过单次 body 限制（nginx 10MB）的大文件：首块 append=false 覆盖，后续 append=true 续写"),
+		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
+		mcp.WithString("path", mcp.Required(), mcp.Description("目标文件的绝对路径")),
+		mcp.WithString("content", mcp.Required(), mcp.Description("要写入的内容（单次建议 <=8MB；更大请拆多块）")),
+		mcp.WithBoolean("append", mcp.Description("追加模式：true 追加到文件末尾（用于多块续写）。默认 false=覆盖")),
+		mcp.WithNumber("chunk_size", mcp.Description("内部每次 WriteAt 的最大字节数（默认 4MB），仅影响内存/单次写大小，不改变写入结果")),
+	), handleWriteFileChunked(sm))
 
 	// 工具 5: 读取本地文件（用于查看配置、脚本等）
 	mcpServer.AddTool(mcp.NewTool("read_local_file",
