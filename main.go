@@ -5,16 +5,18 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
 )
@@ -54,10 +56,12 @@ type Config struct {
 	Servers   map[string]SSHConfig `yaml:"servers"`
 }
 
-// SSHClient 封装 SSH 连接
+// SSHClient 封装 SSH 连接（连接池：复用单条长连接，避免每次调用都重建 SSH 握手）
 type SSHClient struct {
+	mu     sync.Mutex
 	config *ssh.ClientConfig
 	addr   string
+	client *ssh.Client // 持久连接，懒建立、可重连；nil 表示需重建
 }
 
 // ServerManager 管理多个 SSH 连接
@@ -119,6 +123,7 @@ func (sm *ServerManager) GetClient(name string) (*SSHClient, error) {
 		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
 		// 生产环境建议使用 ssh.HostKeyCallback(func(hostname string, remote string, key ssh.PublicKey) error { ... })
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         sshHandshakeTimeout, // 建连超时，避免握手卡死
 	}
 
 	// 创建客户端实例
@@ -138,14 +143,98 @@ func (sm *ServerManager) GetClient(name string) (*SSHClient, error) {
 	return newClient, nil
 }
 
-// RunCommand 在远程服务器上执行命令
-func (sc *SSHClient) RunCommand(cmd string) (string, error) {
+// ==================== SSH 连接池 ====================
+// 原实现每次 RunCommand 都 ssh.Dial 新建连接，付出一次完整 SSH 握手开销；
+// 文件读写/命令执行频繁时，握手成本成为主要延迟来源。
+// 改造：每服务器复用单条持久连接（懒建立、后台保活、传输层断开时重连一次并重试）。
+
+const (
+	sshHandshakeTimeout  = 15 * time.Second // 建连（TCP+KEX+认证）超时，避免握手卡死
+	sshKeepAliveInterval = 30 * time.Second // 保活探测间隔
+)
+
+// getConn 返回一条可用的持久连接；不存在或已被丢弃则（重）建立。
+// 仅在此函数内加锁做建连决策，命令执行在锁外进行，避免串行化同服务器的并发调用。
+func (sc *SSHClient) getConn() (*ssh.Client, error) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+
+	if sc.client != nil {
+		return sc.client, nil
+	}
+
 	conn, err := ssh.Dial("tcp", sc.addr, sc.config)
 	if err != nil {
-		return "", fmt.Errorf("SSH 连接失败: %w", err)
+		return nil, fmt.Errorf("SSH 连接失败: %w", err)
 	}
-	defer conn.Close()
+	sc.client = conn
+	go sc.keepAliveLoop(conn) // 后台保活；连接被替换/关闭时该 goroutine 自行退出
+	return conn, nil
+}
 
+// dropConn 仅在当前缓存的正是 c 时才置空并关闭，避免并发下误关其他连接。
+func (sc *SSHClient) dropConn(c *ssh.Client) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.client == c {
+		sc.client = nil
+	}
+	_ = c.Close()
+}
+
+// connIsAlive 通过 OpenSSH 保活全局请求探测连接是否仍可用。
+func (sc *SSHClient) connIsAlive(c *ssh.Client) bool {
+	_, _, err := c.SendRequest("keepalive@openssh.com", true, nil)
+	return err == nil
+}
+
+// keepAliveLoop 周期性发送保活探测；本 goroutine 持有的 conn 已被替换或连接断开时退出。
+func (sc *SSHClient) keepAliveLoop(conn *ssh.Client) {
+	ticker := time.NewTicker(sshKeepAliveInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		sc.mu.Lock()
+		stillMine := sc.client == conn
+		sc.mu.Unlock()
+		if !stillMine {
+			return // 已被 redial 替换，旧连接由 dropConn 关闭
+		}
+		if _, _, err := conn.SendRequest("keepalive@openssh.com", true, nil); err != nil {
+			sc.dropConn(conn)
+			return
+		}
+	}
+}
+
+// RunCommand 在远程服务器上执行命令（复用持久连接）。
+// 若命令因传输层断开而失败，会重连一次并重试；仅当连接确已死亡才重试，
+// 命令自身非零退出不会触发，避免对任意命令做 at-least-once 的重复执行。
+// 注意：若命令已在远端执行、但响应在传输途中丢失，重试可能造成重复执行——
+// 这是不可靠传输上 at-least-once 重试的固有边界，对当前幂等类工具（stat/tail/base64 -d）安全。
+func (sc *SSHClient) RunCommand(cmd string) (string, error) {
+	conn, err := sc.getConn()
+	if err != nil {
+		return "", err
+	}
+
+	output, err := sc.runOnConn(conn, cmd)
+	if err != nil {
+		// 传输层失败判定：连接已死才重连重试
+		if !sc.connIsAlive(conn) {
+			sc.dropConn(conn)
+			if conn2, derr := sc.getConn(); derr == nil {
+				if out2, rerr := sc.runOnConn(conn2, cmd); rerr == nil {
+					return out2, nil
+				}
+			}
+		}
+		return "", err
+	}
+	return output, nil
+}
+
+// runOnConn 在给定连接上开会话执行命令，返回 stdout；非零退出时把 stderr 并入错误。
+func (sc *SSHClient) runOnConn(conn *ssh.Client, cmd string) (string, error) {
 	session, err := conn.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("创建会话失败: %w", err)
@@ -159,8 +248,22 @@ func (sc *SSHClient) RunCommand(cmd string) (string, error) {
 	if err := session.Run(cmd); err != nil {
 		return "", fmt.Errorf("命令执行失败: %w\n错误输出: %s", err, stderr.String())
 	}
-
 	return stdout.String(), nil
+}
+
+// openSFTP 在持久 SSH 连接上开启 SFTP 子系统。
+// 仅一条 channel 请求（无额外 TCP/KEX），代价远低于一次完整 SSH 握手；
+// 每次都基于当前连接新建，避免连接重连后句柄失效。
+func (sc *SSHClient) openSFTP() (*sftp.Client, error) {
+	conn, err := sc.getConn()
+	if err != nil {
+		return nil, err
+	}
+	scli, err := sftp.NewClient(conn)
+	if err != nil {
+		return nil, fmt.Errorf("SFTP 子系统启动失败: %w", err)
+	}
+	return scli, nil
 }
 
 // ==================== 工具处理函数 ====================
@@ -212,7 +315,7 @@ func handleExecuteCommand(sm *ServerManager) func(ctx context.Context, req mcp.C
 	}
 }
 
-// handleReadFile 读取远程文件
+// handleReadFile 读取远程文件（SFTP 子系统：随机字节读，无 shell/base64 开销）
 func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		serverName := req.GetString("server", "")
@@ -239,42 +342,65 @@ func handleReadFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToo
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// 1) 查文件大小，用于大文件闸门
-		const maxNoLimit = 2 * 1024 * 1024 // 2MB：未指定 limit 时允许直接读取的上限
-		size := int64(0)
-		if sizeOut, serr := client.RunCommand(fmt.Sprintf("stat -c %%s %q 2>/dev/null || wc -c < %q", path, path)); serr == nil {
-			if n, perr := strconv.ParseInt(strings.TrimSpace(sizeOut), 10, 64); perr == nil {
-				size = n
-			}
+		// 复用持久 SSH 连接开启 SFTP 子系统（仅一条 channel 请求，无额外 TCP/KEX）
+		scli, err := client.openSFTP()
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("%v（请确认远程 sshd 已启用 sftp 子系统）", err)), nil
 		}
-		if limit == 0 && size > maxNoLimit {
-			return mcp.NewToolResultError(fmt.Sprintf("文件过大（约 %.1f MB），超过单次读取上限。请使用 offset/limit 分段读取，或改用 scp/sftp 传输大文件", float64(size)/float64(1024*1024))), nil
+		defer scli.Close()
+
+		// 1) 打开并按需取大小（一次 sftp 调用，替代原 shell stat/wc 的额外往返）
+		const maxReadDefault = 4 * 1024 * 1024 // 4MB：未指定 limit 时允许直接读取的上限
+		f, err := scli.Open(path)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("打开文件失败: %v", err)), nil
+		}
+		defer f.Close()
+		fi, err := f.Stat()
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("无法访问文件 %s: %v", path, err)), nil
+		}
+		size := fi.Size()
+
+		if limit == 0 && size > maxReadDefault {
+			return mcp.NewToolResultError(fmt.Sprintf("文件过大（约 %.1f MB），超过单次读取上限。请使用 offset/limit 分段读取", float64(size)/float64(1024*1024))), nil
 		}
 
-		// 2) 分段读取：服务端用 tail|head 切片，整文件不进内存
-		start := offset + 1 // tail -c +K 从 1 开始计数
-		var readCmd string
+		// 2) 计算读取窗口并随机读（ReadAt 天然支持大文件、无需整文件进内存）
+		start := int64(offset)
+		end := size
 		if limit > 0 {
-			readCmd = fmt.Sprintf("tail -c +%d %q | head -c %d", start, path, limit)
-		} else {
-			readCmd = fmt.Sprintf("tail -c +%d %q", start, path)
+			end = start + int64(limit)
 		}
-		output, err := client.RunCommand(readCmd)
-		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+		if end > size {
+			end = size
+		}
+		if start > end {
+			start = end
+		}
+		n := end - start
+		if n <= 0 {
+			return mcp.NewToolResultText(fmt.Sprintf("[文件读取 - 服务器: %s]\n路径: %s\n偏移: %d\n字节数: 0\n\n（已到文件末尾或偏移越界）", serverName, path, offset)), nil
+		}
+
+		buf := make([]byte, n)
+		m, rerr := readExactAt(f, buf, start)
+		buf = buf[:m]
+		if rerr != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("读取文件失败: %v", rerr)), nil
 		}
 
 		// 3) 二进制降级：含非法 UTF-8 时 base64 返回，防止 JSON 序列化损坏
-		if !utf8.ValidString(output) {
-			b64 := base64.StdEncoding.EncodeToString([]byte(output))
-			return mcp.NewToolResultText(fmt.Sprintf("[文件读取 - 二进制/base64]\n服务器: %s\n路径: %s\n偏移: %d\n字节数: %d\n\n%s", serverName, path, offset, len(output), b64)), nil
+		if !utf8.Valid(buf) {
+			b64 := base64.StdEncoding.EncodeToString(buf)
+			return mcp.NewToolResultText(fmt.Sprintf("[文件读取 - 二进制/base64]\n服务器: %s\n路径: %s\n偏移: %d\n字节数: %d\n\n%s", serverName, path, offset, len(buf), b64)), nil
 		}
 
-		return mcp.NewToolResultText(fmt.Sprintf("[文件读取 - 服务器: %s]\n路径: %s\n偏移: %d\n字节数: %d\n\n内容:\n%s", serverName, path, offset, len(output), output)), nil
+		return mcp.NewToolResultText(fmt.Sprintf("[文件读取 - 服务器: %s]\n路径: %s\n偏移: %d\n字节数: %d\n\n内容:\n%s", serverName, path, offset, len(buf), string(buf))), nil
 	}
 }
 
-// handleWriteFile 写入远程文件（覆盖模式）
+// handleWriteFile 写入远程文件（SFTP 子系统：流式分块写，无 base64 膨胀、无单命令长度上限）
 func handleWriteFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		serverName := req.GetString("server", "")
@@ -292,9 +418,18 @@ func handleWriteFile(sm *ServerManager) func(ctx context.Context, req mcp.CallTo
 			return mcp.NewToolResultError("参数 'content' 是必填项（要写入的内容）"), nil
 		}
 
-		const maxWrite = 5 * 1024 * 1024 // 5MB：单条调用写入上限
+		appendMode := req.GetBool("append", false)
+		rawOffset := req.GetInt("offset", 0)
+		writeOffset := int64(rawOffset)
+		if writeOffset < 0 {
+			writeOffset = 0
+		}
+
+		// 单次调用内容上限：受 MCP 传输层（HTTP body / nginx 10MB、stdio 内存）约束，
+		// 超出请分块多次调用（首块 append=false 覆盖，后续 append=true + offset 续写）。
+		const maxWrite = 8 * 1024 * 1024 // 8MB
 		if len(content) > maxWrite {
-			return mcp.NewToolResultError(fmt.Sprintf("写入内容过大（约 %.1f MB），超过单条调用上限。请改用 scp/sftp 传输大文件，或分块写入", float64(len(content))/float64(1024*1024))), nil
+			return mcp.NewToolResultError(fmt.Sprintf("写入内容过大（约 %.1f MB），超过单次调用上限。请分块写入：首块 append=false，后续 append=true 并指定 offset", float64(len(content))/float64(1024*1024))), nil
 		}
 
 		client, err := sm.GetClient(serverName)
@@ -302,21 +437,79 @@ func handleWriteFile(sm *ServerManager) func(ctx context.Context, req mcp.CallTo
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		// 写入远程文件：先将内容 base64 编码，再经带引号 heredoc 写入。
-		// 这样内容与命令彻底解耦——base64 仅含 [A-Za-z0-9+/=]，远端 shell 不会对其中
-		// 任何单引号/双引号/反斜杠/$/反引号做解析，既杜绝命令注入，也避免内容被污染。
-		// 注意：带引号分隔符的 heredoc 已将中间内容视作字面量，旧实现在此之上又对单引号
-		// 做 '\'' 替换（strings.ReplaceAll）属于多余且破坏性操作，会把文件里的 ' 变成 '\''。
-		encoded := base64.StdEncoding.EncodeToString([]byte(content))
-		writeCmd := fmt.Sprintf("base64 -d > %q <<'MCP_EOF'\n%s\nMCP_EOF", path, encoded)
-
-		_, err = client.RunCommand(writeCmd)
+		scli, err := client.openSFTP()
 		if err != nil {
-			return mcp.NewToolResultError(err.Error()), nil
+			return mcp.NewToolResultError(fmt.Sprintf("%v（请确认远程 sshd 已启用 sftp 子系统）", err)), nil
+		}
+		defer scli.Close()
+
+		// 覆盖默认截断；追加模式保留原内容，从指定 offset 续写（支持分块上传）
+		mode := os.O_WRONLY | os.O_CREATE
+		if !appendMode {
+			mode |= os.O_TRUNC
+		}
+		f, err := scli.OpenFile(path, mode)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("打开文件失败: %v", err)), nil
+		}
+		defer f.Close()
+
+		off := writeOffset
+		if appendMode && rawOffset < 0 {
+			// offset 为负：追加到文件末尾
+			if fi, e := scli.Stat(path); e == nil {
+				off = fi.Size()
+			}
 		}
 
-		return mcp.NewToolResultText(fmt.Sprintf("成功写入文件\n服务器: %s\n路径: %s\n大小: %d 字节", serverName, path, len(content))), nil
+		// 流式分块写（每块 4MB），避免单次超大 Write 与内存尖峰
+		const writeChunk = 4 * 1024 * 1024
+		cb := []byte(content)
+		written := 0
+		for written < len(cb) {
+			end := written + writeChunk
+			if end > len(cb) {
+				end = len(cb)
+			}
+			w, werr := f.WriteAt(cb[written:end], off+int64(written))
+			written += w
+			if werr != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("写入文件失败（已写 %d 字节）: %v", written, werr)), nil
+			}
+			if w == 0 {
+				return mcp.NewToolResultError(fmt.Sprintf("写入文件中断（已写 %d 字节，未继续）", written)), nil
+			}
+		}
+
+		return mcp.NewToolResultText(fmt.Sprintf("成功写入文件\n服务器: %s\n路径: %s\n模式: %s\n大小: %d 字节", serverName, path, modeDesc(appendMode), written)), nil
 	}
+}
+
+// readExactAt 从指定偏移循环读取，直到填满 buf 或遇到错误/EOF。
+func readExactAt(f *sftp.File, buf []byte, off int64) (int, error) {
+	total := 0
+	for total < len(buf) {
+		m, err := f.ReadAt(buf[total:], off+int64(total))
+		total += m
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return total, err
+		}
+		if m == 0 {
+			break
+		}
+	}
+	return total, nil
+}
+
+// modeDesc 将追加/覆盖模式转成中文描述，用于回执展示。
+func modeDesc(appendMode bool) string {
+	if appendMode {
+		return "追加"
+	}
+	return "覆盖"
 }
 
 // handleReadRemoteFile 通过工具调用读取本地配置文件中的文件（资源功能）
@@ -380,7 +573,7 @@ func main() {
 
 	// 工具 3: 读取远程文件
 	mcpServer.AddTool(mcp.NewTool("read_file",
-		mcp.WithDescription("从指定的远程服务器读取文件内容"),
+		mcp.WithDescription("通过 SFTP 子系统从指定的远程服务器读取文件内容（支持 offset/limit 字节分页）"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件的绝对路径")),
 		mcp.WithNumber("offset", mcp.Description("起始字节偏移（默认 0，从头开始）")),
@@ -389,10 +582,12 @@ func main() {
 
 	// 工具 4: 写入远程文件
 	mcpServer.AddTool(mcp.NewTool("write_file",
-		mcp.WithDescription("向指定的远程服务器写入文件内容（会覆盖原有内容）"),
+		mcp.WithDescription("向指定的远程服务器写入文件内容（SFTP 子系统，流式分块写，无 base64 膨胀、无单命令长度上限）"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("目标文件的绝对路径")),
 		mcp.WithString("content", mcp.Required(), mcp.Description("要写入的完整内容")),
+		mcp.WithBoolean("append", mcp.Description("追加模式：不截断原文件，从 offset 处续写（用于分块写大文件）。默认 false=覆盖")),
+		mcp.WithNumber("offset", mcp.Description("写入起始字节偏移（配合 append 使用）；为负表示追加到文件末尾。默认 0")),
 	), handleWriteFile(sm))
 
 	// 工具 5: 读取本地文件（用于查看配置、脚本等）
@@ -444,10 +639,10 @@ func startHTTPServer(mcpServer *server.MCPServer, httpCfg HTTPConfig, serverCoun
 	}
 
 	// 构建 Streamable HTTP 服务（CORS 由我们自己的中间件处理，更灵活、可通配所有域名）
-	sseSrv := server.NewStreamableHTTPServer(mcpServer, server.WithEndpointPath(path))
+	streamableSrv := server.NewStreamableHTTPServer(mcpServer, server.WithEndpointPath(path))
 
 	// 鉴权中间件：校验 access_token，防止端点被未授权访问（仅 HTTP 模式生效）
-	authHandler := withAuth(sseSrv, httpCfg.Auth)
+	authHandler := withAuth(streamableSrv, httpCfg.Auth)
 	// 自定义 CORS 中间件包裹在最外层：确保 401 等响应也带 CORS 头，浏览器可读
 	corsHandler := withCORS(authHandler, httpCfg)
 
