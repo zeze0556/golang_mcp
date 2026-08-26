@@ -721,6 +721,7 @@ func main() {
 		mcp.WithDescription("在指定的远程服务器上执行 Shell 命令并返回输出结果"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称（从 list_servers 获取）")),
 		mcp.WithString("command", mcp.Required(), mcp.Description("要执行的 Shell 命令")),
+		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
 	), handleExecuteCommand(sm))
 
 	// 工具 3: 读取远程文件
@@ -732,6 +733,7 @@ func main() {
 		mcp.WithNumber("limit", mcp.Description("读取的最大字节数（默认 0，读到文件末尾）；与行号分页互斥")),
 		mcp.WithNumber("offset_lines", mcp.Description("起始行号（1-based，默认 1 从头）；提供即进入行号分页")),
 		mcp.WithNumber("limit_lines", mcp.Description("读取的最大行数（默认 0 读到末尾）；提供即进入行号分页")),
+		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
 	), handleReadFile(sm))
 
 	// 工具 4: 写入远程文件
@@ -742,6 +744,7 @@ func main() {
 		mcp.WithString("content", mcp.Required(), mcp.Description("要写入的完整内容")),
 		mcp.WithBoolean("append", mcp.Description("追加模式：不截断原文件，从 offset 处续写（用于分块写大文件）。默认 false=覆盖")),
 		mcp.WithNumber("offset", mcp.Description("写入起始字节偏移（配合 append 使用）；为负表示追加到文件末尾。默认 0")),
+		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
 	), handleWriteFile(sm))
 
 	// 工具 4b: 分块上传助手
@@ -752,12 +755,14 @@ func main() {
 		mcp.WithString("content", mcp.Required(), mcp.Description("要写入的内容（单次建议 <=8MB；更大请拆多块）")),
 		mcp.WithBoolean("append", mcp.Description("追加模式：true 追加到文件末尾（用于多块续写）。默认 false=覆盖")),
 		mcp.WithNumber("chunk_size", mcp.Description("内部每次 WriteAt 的最大字节数（默认 4MB），仅影响内存/单次写大小，不改变写入结果")),
+		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
 	), handleWriteFileChunked(sm))
 
 	// 工具 5: 读取本地文件（用于查看配置、脚本等）
 	mcpServer.AddTool(mcp.NewTool("read_local_file",
 		mcp.WithDescription("读取本地机器上的文件内容（用于查看配置文件、脚本等本地资源）"),
 		mcp.WithString("path", mcp.Required(), mcp.Description("本地文件的绝对路径")),
+		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
 	), handleReadConfigFile(sm))
 
 	// 5. 根据配置选择传输模式启动
