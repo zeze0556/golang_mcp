@@ -293,11 +293,9 @@ func handleListServers(sm *ServerManager) func(ctx context.Context, req mcp.Call
 		sb.WriteString("可用的远程服务器列表:\n\n")
 
 		for name, cfg := range sm.configs {
-			sb.WriteString(fmt.Sprintf("**%s**\n", name))
-			sb.WriteString(fmt.Sprintf("  - 地址: %s:%d\n", cfg.Host, cfg.Port))
-			sb.WriteString(fmt.Sprintf("  - 用户: %s\n", cfg.User))
+			sb.WriteString(fmt.Sprintf("**- %s**", name))
 			if cfg.Description != "" {
-				sb.WriteString(fmt.Sprintf("  - 说明: %s\n", cfg.Description))
+				sb.WriteString(fmt.Sprintf(": %s", cfg.Description))
 			}
 			sb.WriteString("\n")
 		}
