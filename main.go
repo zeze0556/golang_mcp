@@ -33,6 +33,11 @@ type SSHConfig struct {
 	Description  string `yaml:"description,omitempty"` // 描述信息，方便 AI 理解用途
 }
 
+// ToolValidation MCP 工具参数校验配置
+type ToolValidation struct {
+	AllowAdditionalProperties bool `yaml:"allow_additional_properties,omitempty"` // 是否允许客户端传递未声明的额外参数，默认 false（严格模式）
+}
+
 // AuthConfig 访问令牌鉴权配置（防止 MCP 端点被未授权访问）
 type AuthConfig struct {
 	Enabled bool     `yaml:"enabled,omitempty"` // 是否启用鉴权，默认 false
@@ -51,9 +56,10 @@ type HTTPConfig struct {
 
 // Config YAML 配置文件结构
 type Config struct {
-	Transport string            `yaml:"transport,omitempty"` // stdio 或 http，默认 stdio
-	HTTP      HTTPConfig        `yaml:"http,omitempty"`      // HTTP 模式配置
-	Servers   map[string]SSHConfig `yaml:"servers"`
+	Transport       string                 `yaml:"transport,omitempty"` // stdio 或 http，默认 stdio
+	HTTP            HTTPConfig             `yaml:"http,omitempty"`      // HTTP 模式配置
+	Servers         map[string]SSHConfig   `yaml:"servers"`
+	ToolValidation  ToolValidation         `yaml:"tool_validation,omitempty"` // 工具参数校验配置
 }
 
 // SSHClient 封装 SSH 连接（连接池：复用单条长连接，避免每次调用都重建 SSH 握手）
@@ -712,20 +718,26 @@ func main() {
 	// 4. 注册工具
 
 	// 工具 1: 列出所有可用服务器
-	mcpServer.AddTool(mcp.NewTool("list_servers",
-		mcp.WithDescription("列出所有已配置的远程服务器及其连接信息"),
-	), handleListServers(sm))
+	toolOpts := []mcp.ToolOption{mcp.WithDescription("列出所有已配置的远程服务器及其连接信息")}
+	if !cfg.ToolValidation.AllowAdditionalProperties {
+		toolOpts = append(toolOpts, mcp.WithSchemaAdditionalProperties(false))
+	}
+	mcpServer.AddTool(mcp.NewTool("list_servers", toolOpts...), handleListServers(sm))
 
 	// 工具 2: 在指定服务器上执行命令
-	mcpServer.AddTool(mcp.NewTool("execute_command",
+	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("在指定的远程服务器上执行 Shell 命令并返回输出结果"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称（从 list_servers 获取）")),
 		mcp.WithString("command", mcp.Required(), mcp.Description("要执行的 Shell 命令")),
 		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
-	), handleExecuteCommand(sm))
+	}
+	if !cfg.ToolValidation.AllowAdditionalProperties {
+		toolOpts = append(toolOpts, mcp.WithSchemaAdditionalProperties(false))
+	}
+	mcpServer.AddTool(mcp.NewTool("execute_command", toolOpts...), handleExecuteCommand(sm))
 
 	// 工具 3: 读取远程文件
-	mcpServer.AddTool(mcp.NewTool("read_file",
+	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("通过 SFTP 子系统从指定的远程服务器读取文件内容。提供 offset_lines/limit_lines 即进入行号分页（按行读取，无需算字节偏移）；否则走 offset/limit 字节分页"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件的绝对路径")),
@@ -734,10 +746,14 @@ func main() {
 		mcp.WithNumber("offset_lines", mcp.Description("起始行号（1-based，默认 1 从头）；提供即进入行号分页")),
 		mcp.WithNumber("limit_lines", mcp.Description("读取的最大行数（默认 0 读到末尾）；提供即进入行号分页")),
 		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
-	), handleReadFile(sm))
+	}
+	if !cfg.ToolValidation.AllowAdditionalProperties {
+		toolOpts = append(toolOpts, mcp.WithSchemaAdditionalProperties(false))
+	}
+	mcpServer.AddTool(mcp.NewTool("read_file", toolOpts...), handleReadFile(sm))
 
 	// 工具 4: 写入远程文件
-	mcpServer.AddTool(mcp.NewTool("write_file",
+	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("向指定的远程服务器写入文件内容（SFTP 子系统，流式分块写，无 base64 膨胀、无单命令长度上限）"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("目标文件的绝对路径")),
@@ -745,10 +761,14 @@ func main() {
 		mcp.WithBoolean("append", mcp.Description("追加模式：不截断原文件，从 offset 处续写（用于分块写大文件）。默认 false=覆盖")),
 		mcp.WithNumber("offset", mcp.Description("写入起始字节偏移（配合 append 使用）；为负表示追加到文件末尾。默认 0")),
 		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
-	), handleWriteFile(sm))
+	}
+	if !cfg.ToolValidation.AllowAdditionalProperties {
+		toolOpts = append(toolOpts, mcp.WithSchemaAdditionalProperties(false))
+	}
+	mcpServer.AddTool(mcp.NewTool("write_file", toolOpts...), handleWriteFile(sm))
 
 	// 工具 4b: 分块上传助手
-	mcpServer.AddTool(mcp.NewTool("write_file_chunked",
+	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("分块上传助手：传入完整 content，工具内部自动按 chunk_size 切片并以 SFTP WriteAt 落盘（调用方无需计算偏移）。支持 append 模式以跨多次调用上传超过单次 body 限制（nginx 10MB）的大文件：首块 append=false 覆盖，后续 append=true 续写"),
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("目标文件的绝对路径")),
@@ -756,14 +776,22 @@ func main() {
 		mcp.WithBoolean("append", mcp.Description("追加模式：true 追加到文件末尾（用于多块续写）。默认 false=覆盖")),
 		mcp.WithNumber("chunk_size", mcp.Description("内部每次 WriteAt 的最大字节数（默认 4MB），仅影响内存/单次写大小，不改变写入结果")),
 		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
-	), handleWriteFileChunked(sm))
+	}
+	if !cfg.ToolValidation.AllowAdditionalProperties {
+		toolOpts = append(toolOpts, mcp.WithSchemaAdditionalProperties(false))
+	}
+	mcpServer.AddTool(mcp.NewTool("write_file_chunked", toolOpts...), handleWriteFileChunked(sm))
 
 	// 工具 5: 读取本地文件（用于查看配置、脚本等）
-	mcpServer.AddTool(mcp.NewTool("read_local_file",
+	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("读取本地机器上的文件内容（用于查看配置文件、脚本等本地资源）"),
 		mcp.WithString("path", mcp.Required(), mcp.Description("本地文件的绝对路径")),
 		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
-	), handleReadConfigFile(sm))
+	}
+	if !cfg.ToolValidation.AllowAdditionalProperties {
+		toolOpts = append(toolOpts, mcp.WithSchemaAdditionalProperties(false))
+	}
+	mcpServer.AddTool(mcp.NewTool("read_local_file", toolOpts...), handleReadConfigFile(sm))
 
 	// 5. 根据配置选择传输模式启动
 	fmt.Fprintln(os.Stderr, "=================================================")
