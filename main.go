@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -287,6 +288,25 @@ func (sc *SSHClient) openSFTP() (*sftp.Client, error) {
 // ==================== 工具处理函数 ====================
 
 // handleListServers 列出所有可用的服务器
+// truncateResult 从 CallToolResult 里取第一个 Content 文本的前 N 字符用于日志预览
+const resultPreviewLen = 2000
+
+func truncateResult(r *mcp.CallToolResult) string {
+	if r == nil {
+		return ""
+	}
+	for _, c := range r.Content {
+		if tc, ok := c.(mcp.TextContent); ok {
+			s := tc.Text
+			if len(s) > resultPreviewLen {
+				s = s[:resultPreviewLen] + "...(truncated)"
+			}
+			return s
+		}
+	}
+	return ""
+}
+
 func handleListServers(sm *ServerManager) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		var sb strings.Builder
@@ -710,8 +730,38 @@ func main() {
 	// 2. 初始化服务器管理器
 	sm := NewServerManager(cfg)
 
-	// 3. 创建 MCP Server
-	mcpServer := server.NewMCPServer("Multi-SSH-Commander", "1.0.0")
+	// 3. 创建 MCP Server（携带结构化日志，记录客户端真实请求）
+	slogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	mcpServer := server.NewMCPServer("Multi-SSH-Commander", "1.0.0", server.WithLogger(slogger))
+
+	// 3.1 自定义工具调用日志中间件：打印 tool 名、参数、耗时、失败原因
+	//     覆盖框架自带日志不记录 parameters 的缺口
+	mcpServer.Use(func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+		return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			start := time.Now()
+			result, err := next(ctx, request)
+			dur := time.Since(start)
+			// 提取关键参数用于日志（脱敏，不输出 host/port/user/key）
+			serverName := request.GetString("server", "")
+			lg := slogger.With(
+				slog.String("tool", request.Method),
+				slog.String("server", serverName),
+				slog.Duration("duration", dur),
+			)
+			if err != nil {
+				lg.Error("mcp.tool.failed", slog.String("error", err.Error()))
+			} else {
+				// 记录返回结果：文本内容截取前 2000 字符防刷屏，错误标记用 isError
+				isError := result != nil && result.IsError
+				lg.Info("mcp.tool.done", slog.Bool("is_error", isError),
+					slog.String("result_preview", truncateResult(result)),
+				)
+			}
+			return result, err
+		}
+	})
 
 	// 4. 注册工具
 
