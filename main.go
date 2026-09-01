@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -731,8 +732,18 @@ func main() {
 	sm := NewServerManager(cfg)
 
 	// 3. 创建 MCP Server（携带结构化日志，记录客户端真实请求）
+	//     日志级别由 MCP_LOG_LEVEL 环境变量控制：DEBUG 会额外打印客户端发送的原始请求内容（含全部参数，可能含敏感信息，仅调试用）
+	logLevel := slog.LevelInfo
+	switch strings.ToUpper(strings.TrimSpace(os.Getenv("MCP_LOG_LEVEL"))) {
+	case "DEBUG":
+		logLevel = slog.LevelDebug
+	case "WARN", "WARNING":
+		logLevel = slog.LevelWarn
+	case "ERROR":
+		logLevel = slog.LevelError
+	}
 	slogger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	}))
 	mcpServer := server.NewMCPServer("Multi-SSH-Commander", "1.0.0", server.WithLogger(slogger))
 
@@ -740,13 +751,22 @@ func main() {
 	//     覆盖框架自带日志不记录 parameters 的缺口
 	mcpServer.Use(func(next server.ToolHandlerFunc) server.ToolHandlerFunc {
 		return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			// DEBUG 模式：打印客户端发送的原始请求内容（含全部参数，可能含敏感信息，仅调试用）
+			if slogger.Enabled(ctx, slog.LevelDebug) {
+				if raw, mErr := json.Marshal(request); mErr == nil {
+					slogger.Debug("mcp.tool.raw_request",
+						slog.String("tool", request.Params.Name),
+						slog.String("raw_request", string(raw)),
+					)
+				}
+			}
 			start := time.Now()
 			result, err := next(ctx, request)
 			dur := time.Since(start)
 			// 提取关键参数用于日志（脱敏，不输出 host/port/user/key）
 			serverName := request.GetString("server", "")
 			lg := slogger.With(
-				slog.String("tool", request.Method),
+				slog.String("tool", request.Params.Name),
 				slog.String("server", serverName),
 				slog.Duration("duration", dur),
 			)
