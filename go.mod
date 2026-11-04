@@ -3,7 +3,7 @@ module ssh-mcp-server
 go 1.26.4
 
 require (
-	github.com/mark3labs/mcp-go v0.55.1
+	github.com/mark3labs/mcp-go v1.5.0
 	github.com/pkg/sftp v1.13.7
 	golang.org/x/crypto v0.53.0
 	gopkg.in/yaml.v3 v3.0.1

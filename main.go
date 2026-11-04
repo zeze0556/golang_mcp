@@ -4,13 +4,17 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +24,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 	"gopkg.in/yaml.v3"
 )
 
@@ -33,11 +38,30 @@ type SSHConfig struct {
 	KeyPath      string `yaml:"key_path,omitempty"`
 	KeyContent   string `yaml:"key_content,omitempty"`
 	Description  string `yaml:"description,omitempty"` // 描述信息，方便 AI 理解用途
+	// InsecureIgnoreHostKey 为 true 时关闭 SSH 主机密钥校验（等价于 ssh.InsecureIgnoreHostKey，存在中间人风险）。
+	// 默认 false：走 known_hosts 校验，校验失败（未知/变更主机）将拒绝连接。
+	InsecureIgnoreHostKey bool `yaml:"insecure_ignore_host_key,omitempty"`
 }
 
 // ToolValidation MCP 工具参数校验配置
 type ToolValidation struct {
 	AllowAdditionalProperties bool `yaml:"allow_additional_properties,omitempty"` // 是否允许客户端传递未声明的额外参数，默认 false（严格模式）
+}
+
+// CommandConfig 命令执行相关的安全/健壮性配置
+type CommandConfig struct {
+	// TimeoutSeconds 单条命令的最大执行时间（秒）。默认 120；设为 0 表示不限时（不推荐）。
+	TimeoutSeconds int `yaml:"timeout_seconds,omitempty"`
+	// MaxOutputMB 单条命令 stdout+stderr 的采集上限（MB）。默认 4；超出部分截断，防止超大输出撑爆响应。
+	MaxOutputMB int `yaml:"max_output_mb,omitempty"`
+}
+
+// LocalReadConfig 本地文件读取（read_local_file 工具）的访问控制
+// 出于安全考虑，该工具默认关闭；开启后仅允许读取 allowed_dirs 指定目录下的文件，
+// 避免被（即便持有 token 的）调用方读取 SSH 私钥、config.yaml 等敏感本地文件。
+type LocalReadConfig struct {
+	Enabled     bool     `yaml:"enabled,omitempty"`
+	AllowedDirs []string `yaml:"allowed_dirs,omitempty"` // 允许读取的本地目录白名单（绝对路径）
 }
 
 // AuthConfig 访问令牌鉴权配置（防止 MCP 端点被未授权访问）
@@ -62,6 +86,11 @@ type Config struct {
 	HTTP            HTTPConfig             `yaml:"http,omitempty"`      // HTTP 模式配置
 	Servers         map[string]SSHConfig   `yaml:"servers"`
 	ToolValidation  ToolValidation         `yaml:"tool_validation,omitempty"` // 工具参数校验配置
+	Command         CommandConfig          `yaml:"command,omitempty"`          // 命令执行超时/输出上限
+	LocalRead       LocalReadConfig        `yaml:"local_read,omitempty"`       // 本地文件读取白名单
+	// KnownHostsPath 全局 known_hosts 文件路径；为空时回退到 ~/.ssh/known_hosts。
+	// 仅当所有服务器都未设置 insecure_ignore_host_key 时生效。
+	KnownHostsPath  string                 `yaml:"known_hosts_path,omitempty"`
 }
 
 // SSHClient 封装 SSH 连接（连接池：复用单条长连接，避免每次调用都重建 SSH 握手）
@@ -78,16 +107,57 @@ type ServerManager struct {
 	mu      sync.RWMutex
 	configs map[string]SSHConfig
 	clients map[string]*SSHClient
+
+	// 运行时参数（由配置解析而来，全局统一）
+	cmdTimeout time.Duration // 单条命令执行超时
+	maxOutput  int           // 单条命令输出采集上限（字节）
+	knownHosts string        // known_hosts 文件路径
+	localRead  LocalReadConfig
 }
 
 // ==================== SSH 客户端逻辑 ====================
 
 // NewServerManager 从配置创建服务器管理器
 func NewServerManager(cfg Config) *ServerManager {
-	return &ServerManager{
-		configs: cfg.Servers,
-		clients: make(map[string]*SSHClient),
+	cmdTimeout := time.Duration(cfg.Command.TimeoutSeconds) * time.Second
+	if cfg.Command.TimeoutSeconds <= 0 {
+		cmdTimeout = 120 * time.Second
 	}
+	maxOutput := cfg.Command.MaxOutputMB * 1024 * 1024
+	if cfg.Command.MaxOutputMB <= 0 {
+		maxOutput = 4 * 1024 * 1024
+	}
+	return &ServerManager{
+		configs:    cfg.Servers,
+		clients:    make(map[string]*SSHClient),
+		cmdTimeout: cmdTimeout,
+		maxOutput:  maxOutput,
+		knownHosts: cfg.KnownHostsPath,
+		localRead:  cfg.LocalRead,
+	}
+}
+
+// buildHostKeyCallback 构造 SSH 主机密钥校验回调。
+//   - insecure=true：直接返回 InsecureIgnoreHostKey（跳过校验，存在中间人风险）
+//   - insecure=false（默认）：使用 known_hosts 进行严格校验；文件不存在/不可读时
+//     返回一个失败关闭的回调，强制用户先准备 known_hosts 或显式 insecure_ignore_host_key: true
+func buildHostKeyCallback(knownHostsPath string, insecure bool) ssh.HostKeyCallback {
+	if insecure {
+		return ssh.InsecureIgnoreHostKey()
+	}
+	path := knownHostsPath
+	if path == "" {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = filepath.Join(home, ".ssh", "known_hosts")
+		}
+	}
+	cb, err := knownhosts.New(path)
+	if err != nil {
+		return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+			return fmt.Errorf("无法加载 known_hosts (%s)：%w；请先生成 known_hosts（如 ssh-keyscan 目标主机），或为该服务器显式设置 insecure_ignore_host_key: true", path, err)
+		}
+	}
+	return cb
 }
 
 // GetClient 获取或创建 SSH 连接（单例模式，并发安全）
@@ -130,8 +200,8 @@ func (sm *ServerManager) GetClient(name string) (*SSHClient, error) {
 	sshConfig := &ssh.ClientConfig{
 		User: cfg.User,
 		Auth: []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		// 生产环境建议使用 ssh.HostKeyCallback(func(hostname string, remote string, key ssh.PublicKey) error { ... })
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		// 默认走 known_hosts 严格校验；仅当该服务器显式 insecure_ignore_host_key: true 时才跳过。
+		HostKeyCallback: buildHostKeyCallback(sm.knownHosts, cfg.InsecureIgnoreHostKey),
 		Timeout:         sshHandshakeTimeout, // 建连超时，避免握手卡死
 	}
 
@@ -220,24 +290,53 @@ func (sc *SSHClient) keepAliveLoop(conn *ssh.Client) {
 	}
 }
 
+// cappedBuffer 带上限的写入缓冲：超过 limit 字节后停止写入并标记 truncated，
+// 用于限制单条命令的 stdout/stderr 采集量，防止超大输出撑爆响应/内存。
+type cappedBuffer struct {
+	buf       bytes.Buffer
+	limit     int
+	truncated bool
+}
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if c.limit <= 0 {
+		return c.buf.Write(p)
+	}
+	if c.buf.Len() >= c.limit {
+		c.truncated = true
+		return len(p), nil
+	}
+	room := c.limit - c.buf.Len()
+	if len(p) > room {
+		c.buf.Write(p[:room])
+		c.truncated = true
+		return len(p), nil
+	}
+	return c.buf.Write(p)
+}
+
+func (c *cappedBuffer) String() string { return c.buf.String() }
+
+// errCmdAborted 表示命令因超时或客户端取消而被中断（非传输层错误，不应重连重试）。
+var errCmdAborted = errors.New("command aborted by timeout or cancellation")
+
 // RunCommand 在远程服务器上执行命令（复用持久连接）。
+// ctx 用于取消/超时：超时或被客户端取消时会关闭会话（进而通知远端终止进程）；timeout/maxOutput 控制执行时限与输出上限。
 // 若命令因传输层断开而失败，会重连一次并重试；仅当连接确已死亡才重试，
-// 命令自身非零退出不会触发，避免对任意命令做 at-least-once 的重复执行。
-// 注意：若命令已在远端执行、但响应在传输途中丢失，重试可能造成重复执行——
-// 这是不可靠传输上 at-least-once 重试的固有边界，对当前幂等类工具（stat/tail/base64 -d）安全。
-func (sc *SSHClient) RunCommand(cmd string) (string, error) {
+// 命令自身非零退出、或超时/取消都不会触发重试，避免对任意命令做 at-least-once 的重复执行。
+func (sc *SSHClient) RunCommand(ctx context.Context, cmd string, timeout time.Duration, maxOutput int) (string, error) {
 	conn, err := sc.getConn()
 	if err != nil {
 		return "", err
 	}
 
-	output, err := sc.runOnConn(conn, cmd)
+	output, err := sc.runOnConn(ctx, conn, cmd, timeout, maxOutput)
 	if err != nil {
-		// 传输层失败判定：连接已死才重连重试
-		if !sc.connIsAlive(conn) {
+		// 仅传输层错误（连接已死）才重连重试；超时/取消（errCmdAborted）不重试。
+		if !errors.Is(err, errCmdAborted) && !sc.connIsAlive(conn) {
 			sc.dropConn(conn)
 			if conn2, derr := sc.getConn(); derr == nil {
-				if out2, rerr := sc.runOnConn(conn2, cmd); rerr == nil {
+				if out2, rerr := sc.runOnConn(ctx, conn2, cmd, timeout, maxOutput); rerr == nil {
 					return out2, nil
 				}
 			}
@@ -248,21 +347,52 @@ func (sc *SSHClient) RunCommand(cmd string) (string, error) {
 }
 
 // runOnConn 在给定连接上开会话执行命令，返回 stdout；非零退出时把 stderr 并入错误。
-func (sc *SSHClient) runOnConn(conn *ssh.Client, cmd string) (string, error) {
+// 通过 goroutine + select 在 ctx 超时/取消时关闭会话以中断远端进程；输出受 maxOutput 限制。
+func (sc *SSHClient) runOnConn(ctx context.Context, conn *ssh.Client, cmd string, timeout time.Duration, maxOutput int) (string, error) {
 	session, err := conn.NewSession()
 	if err != nil {
 		return "", fmt.Errorf("创建会话失败: %w", err)
 	}
 	defer session.Close()
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr cappedBuffer
+	stdout.limit = maxOutput
+	stderr.limit = maxOutput
 	session.Stdout = &stdout
 	session.Stderr = &stderr
 
-	if err := session.Run(cmd); err != nil {
-		return "", fmt.Errorf("命令执行失败: %w\n错误输出: %s", err, stderr.String())
+	// 在调用方 ctx 之上叠加命令级超时；无 timeout 时仍随调用方 ctx 取消。
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		runCtx, cancel = context.WithCancel(ctx)
 	}
-	return stdout.String(), nil
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- session.Run(cmd) }()
+
+	select {
+	case runErr := <-done:
+		if runErr != nil {
+			msg := fmt.Sprintf("命令执行失败: %v", runErr)
+			if stderr.truncated {
+				msg += fmt.Sprintf("（stderr 超过 %d 字节已截断）", maxOutput)
+			}
+			return "", fmt.Errorf("%s\n错误输出: %s", msg, stderr.String())
+		}
+		out := stdout.String()
+		if stdout.truncated {
+			out += fmt.Sprintf("\n... (输出超过 %d 字节已截断，请加过滤条件或将结果重定向到文件后用 read_file 读取)", maxOutput)
+		}
+		return out, nil
+	case <-runCtx.Done():
+		// 超时/取消：关闭会话以通知远端终止进程（连接缓存保留，供后续调用复用）。
+		_ = session.Close()
+		return "", fmt.Errorf("%w: 时限 %v: %v", errCmdAborted, timeout, runCtx.Err())
+	}
 }
 
 // openSFTP 返回与当前持久 SSH 连接绑定的 SFTP 客户端。
@@ -310,10 +440,23 @@ func truncateResult(r *mcp.CallToolResult) string {
 
 func handleListServers(sm *ServerManager) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		// 按名称排序，保证结果稳定（map 遍历顺序随机）
+		names := make([]string, 0, len(sm.configs))
+		for name := range sm.configs {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		type srvInfo struct {
+			Name        string `json:"name"`
+			Description string `json:"description,omitempty"`
+		}
+		infos := make([]srvInfo, 0, len(names))
 		var sb strings.Builder
 		sb.WriteString("可用的远程服务器列表:\n\n")
-
-		for name, cfg := range sm.configs {
+		for _, name := range names {
+			cfg := sm.configs[name]
+			infos = append(infos, srvInfo{Name: name, Description: cfg.Description})
 			sb.WriteString(fmt.Sprintf("**- %s**", name))
 			if cfg.Description != "" {
 				sb.WriteString(fmt.Sprintf(": %s", cfg.Description))
@@ -321,7 +464,17 @@ func handleListServers(sm *ServerManager) func(ctx context.Context, req mcp.Call
 			sb.WriteString("\n")
 		}
 
-		return mcp.NewToolResultText(sb.String()), nil
+		// 同时返回结构化内容（供程序化消费）与文本回退（供模型阅读）
+		structured := map[string]any{
+			"count":    len(infos),
+			"servers":  infos,
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				mcp.TextContent{Type: "text", Text: sb.String()},
+			},
+			StructuredContent: structured,
+		}, nil
 	}
 }
 
@@ -343,7 +496,7 @@ func handleExecuteCommand(sm *ServerManager) func(ctx context.Context, req mcp.C
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 
-		output, err := client.RunCommand(command)
+		output, err := client.RunCommand(ctx, command, sm.cmdTimeout, sm.maxOutput)
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -650,14 +803,14 @@ func handleWriteFileChunked(sm *ServerManager) func(ctx context.Context, req mcp
 			return mcp.NewToolResultError(fmt.Sprintf("分块写入失败: %v", werr)), nil
 		}
 
-		// 回执给出续写所需的偏移提示（append 时即当前文件总大小）
+		// 回执给出当前文件大小（append 时为续写起点），便于调用方后续追加
 		nextOffset := int64(written)
 		if appendMode {
 			if fi, e := scli.Stat(path); e == nil {
 				nextOffset = fi.Size()
 			}
 		}
-		return mcp.NewToolResultText(fmt.Sprintf("成功分块写入文件\n服务器: %s\n路径: %s\n模式: %s\n本次写入: %d 字节\n下次续写偏移(append): %d",
+		return mcp.NewToolResultText(fmt.Sprintf("成功分块写入文件\n服务器: %s\n路径: %s\n模式: %s\n本次写入: %d 字节\n当前文件大小: %d",
 			serverName, path, modeDesc(appendMode), written, nextOffset)), nil
 	}
 }
@@ -689,15 +842,34 @@ func modeDesc(appendMode bool) string {
 	return "覆盖"
 }
 
-// handleReadRemoteFile 通过工具调用读取本地配置文件中的文件（资源功能）
+// handleReadConfigFile 读取本地机器上的文件内容。
+// 出于安全考虑，默认不启用；启用后仅允许访问 allowed_dirs 下的文件，
+// 避免被（即便持有 token 的）调用方读取 SSH 私钥、config.yaml 等敏感本地文件。
 func handleReadConfigFile(sm *ServerManager) func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if !sm.localRead.Enabled {
+			return mcp.NewToolResultError("本地文件读取未启用（请在 config.yaml 中设置 local_read.enabled: true）"), nil
+		}
 		path := req.GetString("path", "")
 		if path == "" {
 			return mcp.NewToolResultError("参数 'path' 是必填项"), nil
 		}
 
-		data, err := os.ReadFile(path)
+		clean := filepath.Clean(path)
+		allowed := false
+		for _, dir := range sm.localRead.AllowedDirs {
+			base := filepath.Clean(dir)
+			rel, err := filepath.Rel(base, clean)
+			if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != string(filepath.Separator) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return mcp.NewToolResultError(fmt.Sprintf("路径 %s 不在允许目录（local_read.allowed_dirs）内，已拒绝", path)), nil
+		}
+
+		data, err := os.ReadFile(clean)
 		if err != nil {
 			return mcp.NewToolResultError(fmt.Sprintf("读取文件失败: %v", err)), nil
 		}
@@ -765,9 +937,11 @@ func main() {
 			dur := time.Since(start)
 			// 提取关键参数用于日志（脱敏，不输出 host/port/user/key）
 			serverName := request.GetString("server", "")
+			reason := request.GetString("reason", "")
 			lg := slogger.With(
 				slog.String("tool", request.Params.Name),
 				slog.String("server", serverName),
+				slog.String("reason", reason), // 操作原因（审计记录）
 				slog.Duration("duration", dur),
 			)
 			if err != nil {
@@ -786,7 +960,10 @@ func main() {
 	// 4. 注册工具
 
 	// 工具 1: 列出所有可用服务器
-	toolOpts := []mcp.ToolOption{mcp.WithDescription("列出所有已配置的远程服务器及其连接信息")}
+	toolOpts := []mcp.ToolOption{
+		mcp.WithDescription("列出所有已配置的远程服务器及其连接信息"),
+		mcp.WithReadOnlyHintAnnotation(true), // 只读：仅列举，不改动远程
+	}
 	if !cfg.ToolValidation.AllowAdditionalProperties {
 		toolOpts = append(toolOpts, mcp.WithSchemaAdditionalProperties(false))
 	}
@@ -795,6 +972,8 @@ func main() {
 	// 工具 2: 在指定服务器上执行命令
 	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("在指定的远程服务器上执行 Shell 命令并返回输出结果"),
+		mcp.WithDestructiveHintAnnotation(true), // 会改动远程环境（执行任意命令）
+		mcp.WithOpenWorldHintAnnotation(true),   // 命令内容由调用方决定，作用域开放
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称（从 list_servers 获取）")),
 		mcp.WithString("command", mcp.Required(), mcp.Description("要执行的 Shell 命令")),
 		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
@@ -807,12 +986,13 @@ func main() {
 	// 工具 3: 读取远程文件
 	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("通过 SFTP 子系统从指定的远程服务器读取文件内容。提供 offset_lines/limit_lines 即进入行号分页（按行读取，无需算字节偏移）；否则走 offset/limit 字节分页"),
+		mcp.WithReadOnlyHintAnnotation(true), // 只读：不改动远程文件
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("文件的绝对路径")),
 		mcp.WithNumber("offset", mcp.Description("起始字节偏移（默认 0，从头开始）；与行号分页互斥")),
 		mcp.WithNumber("limit", mcp.Description("读取的最大字节数（默认 0，读到文件末尾）；与行号分页互斥")),
-		mcp.WithNumber("offset_lines", mcp.Description("起始行号（1-based，默认 1 从头）；提供即进入行号分页")),
-		mcp.WithNumber("limit_lines", mcp.Description("读取的最大行数（默认 0 读到末尾）；提供即进入行号分页")),
+		mcp.WithNumber("offset_lines", mcp.Description("起始行号（1-based）；提供 >0 即进入行号分页，否则走字节分页")),
+		mcp.WithNumber("limit_lines", mcp.Description("读取的最大行数（默认 0 读到末尾）；提供 >0 即进入行号分页")),
 		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
 	}
 	if !cfg.ToolValidation.AllowAdditionalProperties {
@@ -823,6 +1003,8 @@ func main() {
 	// 工具 4: 写入远程文件
 	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("向指定的远程服务器写入文件内容（SFTP 子系统，流式分块写，无 base64 膨胀、无单命令长度上限）"),
+		mcp.WithDestructiveHintAnnotation(true), // 会覆盖/追加远程文件
+		mcp.WithOpenWorldHintAnnotation(true),   // 写入路径/内容由调用方决定
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("目标文件的绝对路径")),
 		mcp.WithString("content", mcp.Required(), mcp.Description("要写入的完整内容")),
@@ -838,6 +1020,8 @@ func main() {
 	// 工具 4b: 分块上传助手
 	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("分块上传助手：传入完整 content，工具内部自动按 chunk_size 切片并以 SFTP WriteAt 落盘（调用方无需计算偏移）。支持 append 模式以跨多次调用上传超过单次 body 限制（nginx 10MB）的大文件：首块 append=false 覆盖，后续 append=true 续写"),
+		mcp.WithDestructiveHintAnnotation(true), // 会覆盖/追加远程文件
+		mcp.WithOpenWorldHintAnnotation(true),   // 写入路径/内容由调用方决定
 		mcp.WithString("server", mcp.Required(), mcp.Description("服务器名称")),
 		mcp.WithString("path", mcp.Required(), mcp.Description("目标文件的绝对路径")),
 		mcp.WithString("content", mcp.Required(), mcp.Description("要写入的内容（单次建议 <=8MB；更大请拆多块）")),
@@ -853,6 +1037,7 @@ func main() {
 	// 工具 5: 读取本地文件（用于查看配置、脚本等）
 	toolOpts = []mcp.ToolOption{
 		mcp.WithDescription("读取本地机器上的文件内容（用于查看配置文件、脚本等本地资源）"),
+		mcp.WithReadOnlyHintAnnotation(true), // 只读：仅读取本地文件（且受 local_read.allowed_dirs 限制）
 		mcp.WithString("path", mcp.Required(), mcp.Description("本地文件的绝对路径")),
 		mcp.WithString("reason", mcp.Description("操作原因（审计记录）")),
 	}
@@ -903,16 +1088,24 @@ func startHTTPServer(mcpServer *server.MCPServer, httpCfg HTTPConfig, serverCoun
 		path = "/mcp"
 	}
 
-	// 构建 Streamable HTTP 服务（CORS 由我们自己的中间件处理，更灵活、可通配所有域名）
-	streamableSrv := server.NewStreamableHTTPServer(mcpServer, server.WithEndpointPath(path))
+	// 构建 Streamable HTTP 服务：端点路径 + 库内置 CORS（替代手写中间件，减少维护面）。
+	streamOpts := []server.StreamableHTTPOption{
+		server.WithEndpointPath(path),
+	}
+	if corsOpts := buildCORSOptions(httpCfg); corsOpts != nil {
+		streamOpts = append(streamOpts, server.WithStreamableHTTPCORS(corsOpts...))
+	}
+	streamableSrv := server.NewStreamableHTTPServer(mcpServer, streamOpts...)
 
-	// 鉴权中间件：校验 access_token，防止端点被未授权访问（仅 HTTP 模式生效）
-	authHandler := withAuth(streamableSrv, httpCfg.Auth)
-	// 自定义 CORS 中间件包裹在最外层：确保 401 等响应也带 CORS 头，浏览器可读
-	corsHandler := withCORS(authHandler, httpCfg)
+	// 鉴权中间件：mcp-go 库内置鉴权为 OAuth 2.1（需授权服务器），与本项目“静态 access_token 列表”模型不符，
+	// 故保留轻量静态令牌中间件（Bearer / X-Access-Token）。未启用则直接透传。
+	var handler http.Handler = streamableSrv
+	if httpCfg.Auth.Enabled {
+		handler = withAuth(handler, httpCfg)
+	}
 
 	mux := http.NewServeMux()
-	mux.Handle(path, corsHandler)
+	mux.Handle(path, handler)
 	// 健康检查端点，方便用 curl 快速验证服务存活（无需构造 MCP 协议请求）
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -943,82 +1136,28 @@ func startHTTPServer(mcpServer *server.MCPServer, httpCfg HTTPConfig, serverCoun
 	}
 }
 
-// withCORS 返回一个带 CORS 支持的 http.Handler。
-// 相比 mcp-go 自带的 CORS，它的优势：
-//   - cors_origins 包含 "*" 时允许任意域名（通配所有）
-//   - 预检(OPTIONS)请求回显浏览器声明的所有请求头，自动放行 mcp-protocol-version 等自定义头
-//   - 同源/无 Origin 请求（curl、nginx 内部转发）直接透传，不附加 CORS 头
-func withCORS(next http.Handler, cfg HTTPConfig) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
-		// 非跨域请求（curl、同域、nginx 内部转发）直接透传
-		if origin == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		allowOrigin := resolveCORSOrigin(origin, cfg.CORSOrigins)
-		if allowOrigin == "" {
-			// 来源不在白名单，按普通请求处理（不附加 CORS 头）
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		w.Header().Set("Vary", "Origin")
-		w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
-		if cfg.CORSCredentials {
-			w.Header().Set("Access-Control-Allow-Credentials", "true")
-		}
-		// 暴露给浏览器的响应头（含会话 ID，前端必须能读取）
-		w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id, Content-Type")
-
-		// 处理 CORS 预检请求（浏览器在发实际请求前会先发 OPTIONS）
-		if r.Method == http.MethodOptions {
-			// 回显浏览器在预检中声明的请求头，确保 mcp-protocol-version 等自定义头被放行
-			reqHeaders := r.Header.Get("Access-Control-Request-Headers")
-			if reqHeaders == "" {
-				reqHeaders = "Content-Type, Authorization, Mcp-Session-Id, Accept, Mcp-Protocol-Version, Last-Event-ID"
-			}
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
-			w.Header().Set("Access-Control-Max-Age", "86400")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-// resolveCORSOrigin 根据配置解析 Access-Control-Allow-Origin 的值。
-// 返回空字符串表示来源不被允许。
-func resolveCORSOrigin(origin string, allowed []string) string {
-	if len(allowed) == 0 {
-		return ""
+// buildCORSOptions 将 HTTPConfig 映射为 mcp-go 库内置的 CORS 选项。
+// 仅在配置了 cors_origins 时返回非 nil（即启用 CORS）；未配置则 nil（不启用 CORS，由反代/同域处理跨域）。
+func buildCORSOptions(cfg HTTPConfig) []server.CORSOption {
+	if len(cfg.CORSOrigins) == 0 {
+		return nil
 	}
-	// 通配：允许任意域名。若同时要求凭证，则回显具体来源（"*" 不能与凭证共存，规范限制）
-	if contains(allowed, "*") {
-		if origin == "" {
-			return "*"
-		}
-		return origin
+	opts := []server.CORSOption{
+		server.WithCORSAllowedOrigins(cfg.CORSOrigins...),
+		server.WithCORSAllowedMethods("GET", "POST", "OPTIONS"),
+		// 放行 MCP 所需的自定义请求头
+		server.WithCORSAllowedHeaders(
+			"Content-Type", "Authorization", "Mcp-Session-Id",
+			"Accept", "Mcp-Protocol-Version", "Last-Event-ID",
+		),
+		// 暴露会话 ID 等响应头，前端必须能读取
+		server.WithCORSExposedHeaders("Mcp-Session-Id", "Content-Type"),
+		server.WithCORSMaxAge(86400),
 	}
-	// 精确匹配白名单
-	for _, a := range allowed {
-		if a == origin {
-			return origin
-		}
+	if cfg.CORSCredentials {
+		opts = append(opts, server.WithCORSAllowCredentials())
 	}
-	return ""
-}
-
-func contains(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
+	return opts
 }
 
 // resolveAuthTokens 解析配置中的令牌，支持 ${ENV_VAR} 从环境变量读取（避免明文写入 config.yaml）
@@ -1046,9 +1185,9 @@ func resolveAuthTokens(cfg AuthConfig) []string {
 //     1. Authorization: Bearer <token>
 //     2. X-Access-Token: <token>
 //   - 未启用或令牌列表为空时直接透传（不鉴权）
-func withAuth(next http.Handler, cfg AuthConfig) http.Handler {
+func withAuth(next http.Handler, cfg HTTPConfig) http.Handler {
 	validTokens := make(map[string]bool)
-	for _, t := range resolveAuthTokens(cfg) {
+	for _, t := range resolveAuthTokens(cfg.Auth) {
 		validTokens[t] = true
 	}
 
@@ -1059,7 +1198,7 @@ func withAuth(next http.Handler, cfg AuthConfig) http.Handler {
 			return
 		}
 		// 未启用或没有合法令牌时直接放行
-		if !cfg.Enabled || len(validTokens) == 0 {
+		if !cfg.Auth.Enabled || len(validTokens) == 0 {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -1070,12 +1209,46 @@ func withAuth(next http.Handler, cfg AuthConfig) http.Handler {
 			return
 		}
 
-		// 鉴权失败：返回 401，并附带 JSON-RPC 风格错误信息
+		// 鉴权失败：返回 401。CORS 由 mcp-go 库内置（作用在 streamableSrv 内层），
+		// 而本 401 在到达 streamableSrv 之前产生，故此处手动补 CORS 头，保证跨域浏览器能读取该响应。
+		if ao := resolveCORSOrigin(r.Header.Get("Origin"), cfg.CORSOrigins); ao != "" {
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Origin", ao)
+			if cfg.CORSCredentials {
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"Unauthorized: invalid or missing access_token"},"id":null}`))
 	})
+}
+
+// resolveCORSOrigin 根据配置解析允许访问的源（用于 auth 层 401 响应补 CORS 头）。
+// 返回空字符串表示来源不被允许。库内置 CORS 已处理正常请求，此函数仅服务于 401 边缘场景。
+func resolveCORSOrigin(origin string, allowed []string) string {
+	if origin == "" || len(allowed) == 0 {
+		return ""
+	}
+	if contains(allowed, "*") {
+		return origin
+	}
+	for _, a := range allowed {
+		if a == origin {
+			return origin
+		}
+	}
+	return ""
+}
+
+func contains(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // extractToken 从请求中提取 access_token（优先 Authorization: Bearer，其次 X-Access-Token 头）

@@ -40,6 +40,27 @@ http:
 tool_validation:
   allow_additional_properties: false  # 设为 true 则放宽校验，允许任意额外参数
 
+# ============================================
+# 命令执行安全 / 健壮性配置
+# ============================================
+command:
+  timeout_seconds: 120   # 单条命令最大执行时间（秒），超时即中断远端进程；0 表示不限时（不推荐）
+  max_output_mb: 4       # 单条命令 stdout+stderr 采集上限（MB），超出自动截断，防止超大输出撑爆响应
+
+# ============================================
+# 本地文件读取控制（read_local_file 工具）
+# ============================================
+# 出于安全考虑默认关闭；开启后仅允许读取 allowed_dirs 指定目录下的文件，
+# 避免被（即便持有 token 的）调用方读取 SSH 私钥、config.yaml 等敏感本地文件。
+local_read:
+  enabled: false
+  allowed_dirs:
+    - "C:/Users/YourName/scripts"   # 仅允许读取这些目录（绝对路径）；为空则启用后也不放行任何路径
+
+# known_hosts 文件路径（全局）；为空时回退到 ~/.ssh/known_hosts。
+# 仅当所有服务器都未设置 insecure_ignore_host_key 时生效。
+known_hosts_path: ""
+
 
 # ============================================
 # 远程服务器清单（支持任意数量）
@@ -51,6 +72,7 @@ servers:
     port: 22
     user: "root"                # 改为你的 SSH 用户名
     key_path: "C:/Users/YourName/.ssh/id_ed25519"  # 改为你的私钥路径（Windows 用正斜杠）
+    # insecure_ignore_host_key: false  # 默认 false=走 known_hosts 校验；设为 true 可跳过主机密钥校验（仅测试/内网，存在中间人风险）
     description: "前端应用服务器，运行 Nginx + Node.js"
 
   # 场景 2: 直接粘贴私钥内容（适合容器化部署）
