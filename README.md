@@ -10,8 +10,19 @@
 | `list_servers` | 列出所有已配置的远程服务器 |
 | `execute_command` | 在指定服务器执行 Shell 命令并回显 stdout/stderr |
 | `read_file` | 读取远程文件内容 |
-| `write_file` | 写入/覆盖远程文件（带 Shell 注入防护） |
-| `read_local_file` | 读取本地文件（查看配置/脚本） |
+| `write_file` | 写入/覆盖远程文件（经 SFTP 直写，不经过 shell） |
+| `read_local_file` | 读取本地文件（**默认关闭**，需 `local_read` 白名单开启） |
+
+## 安全与健壮性说明
+
+- **SSH 主机密钥校验（默认开启）**：除显式设置 `insecure_ignore_host_key: true` 的服务器外，所有连接均通过 `known_hosts` 校验，防止中间人攻击。首次连接前请先用 `ssh-keyscan` 把目标主机写入 `~/.ssh/known_hosts`（或全局 `known_hosts_path`）。若文件缺失或主机未知，连接会失败关闭并给出明确提示。
+- **本地文件读取默认关闭**：`read_local_file` 默认不可用；需在 `local_read.enabled: true` 并配置 `allowed_dirs` 目录白名单后才放行，避免被（即便持有令牌的）调用方读取 SSH 私钥、`config.yaml` 等敏感本地文件。
+- **命令执行有超时与输出上限**：`command.timeout_seconds`（默认 120s）超时即中断远端进程；`command.max_output_mb`（默认 4MB）超出自动截断，防止超大输出撑爆响应。
+- **工具注解**：所有工具已标注 `readOnlyHint` / `destructiveHint` / `openWorldHint`，便于客户端对危险操作做安全门禁。
+- **结构化输出**：`list_servers` 同时返回结构化内容（JSON，字段 `count` / `servers`）与文本回退，便于程序化消费。
+- **操作审计**：工具的 `reason` 参数会进入结构化日志（`mcp.tool.done` / `mcp.tool.failed` 均带 `reason` 字段），可用于事后审计。
+
+> 协议版本由客户端与服务端自动协商，无需手动修改；当前 mcp-go 基线支持到 `2025-06-18` / `2025-11-25`。
 
 ## 快速开始
 
@@ -63,9 +74,9 @@ http:
 #### CORS 通配说明
 
 - `cors_origins: ["*"]` → 允许任意域名跨域访问（最适合开发 / 局域网多前端场景）。
-- 本服务使用**自定义 CORS 中间件**：预检(OPTIONS)会回显浏览器声明的所有请求头，因此
-  llama.cpp Web 前端发出的 `mcp-protocol-version`、`mcp-session-id` 等自定义头均被放行，
-  不会出现 "Failed to fetch (check CORS?)" 错误。
+- CORS 由 **mcp-go 库内置**（`WithStreamableHTTPCORS`）处理：预检(OPTIONS)自动放行，
+  `mcp-protocol-version`、`mcp-session-id` 等自定义头已在允许列表内，不会出现
+  "Failed to fetch (check CORS?)" 错误；非白名单来源则不带 CORS 头（被浏览器拦截）。
 - 若只打算给特定前端用，把 `"*"` 换成具体源即可（如 `"http://192.168.2.236:8082"`）。
 - 若经 nginx 反代且由 nginx 统一处理 CORS，可把 `cors_origins` 留空（不启用），由反代层负责跨域。
 
@@ -95,7 +106,7 @@ X-Access-Token: <token>
 ```
 
 > 预检请求（OPTIONS）**不受**鉴权拦截，以保证跨域握手正常完成；仅实际请求（POST/GET）需要令牌。
-> 启用了 `auth` 时，CORS 与鉴权中间件会同时生效：401 响应也会带上 CORS 头，浏览器能正常读取。
+> 启用了 `auth` 时，跨域实际请求未带令牌会返回 401，该 401 响应也补上了 CORS 头，浏览器能正常读取。
 
 生成强令牌（任选其一）：
 
