@@ -1,4 +1,4 @@
-module ssh-mcp-server
+module github.com/zeze0556/golang_mcp
 
 go 1.26.4
 
