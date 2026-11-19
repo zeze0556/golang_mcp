@@ -11,7 +11,12 @@
 | `execute_command` | 在指定服务器执行 Shell 命令并回显 stdout/stderr |
 | `read_file` | 读取远程文件内容 |
 | `write_file` | 写入/覆盖远程文件（经 SFTP 直写，不经过 shell） |
+| `write_file_chunked` | 分块上传助手（自动切片，跨多次调用续写大文件） |
 | `read_local_file` | 读取本地文件（**默认关闭**，需 `local_read` 白名单开启） |
+| `kb.search` | 知识库混合检索，返回带引用片段（**默认关闭**，需 `knowledge_base.enabled: true`） |
+| `kb.fetch` | 按 chunk_id/doc_id 取相邻片段 |
+| `kb.cite` | 按 chunk_id 反查带行号原文（可核验引用） |
+| `kb.list_scopes` | 列出当前 token 可见的知识域 |
 
 ## 安全与健壮性说明
 
@@ -22,7 +27,7 @@
 - **结构化输出**：`list_servers` 同时返回结构化内容（JSON，字段 `count` / `servers`）与文本回退，便于程序化消费。
 - **操作审计**：工具的 `reason` 参数会进入结构化日志（`mcp.tool.done` / `mcp.tool.failed` 均带 `reason` 字段），可用于事后审计。
 
-> 协议版本由客户端与服务端自动协商，无需手动修改；当前 mcp-go 基线支持到 `2025-06-18` / `2025-11-25`。
+> 协议版本由客户端与服务端自动协商，无需手动修改；当前 mcp-go **v1.5.0** 支持到 `2026-07-28`（含无 session 的 modern 语义）及更早版本。
 
 ## 快速开始
 
@@ -212,3 +217,98 @@ sudo fail2ban-client banned mcp-auth
 - `maxretry` / `findtime` / `bantime` 在 jail 配置中按需调整。
 - **仅在经 nginx 暴露时适用**（fail2ban 为 Linux 工具）。若你直接把 Go 服务暴露且无 nginx，
   则需要 Go 自己按 nginx 格式写访问日志——届时告知我，我再给 Go 加一个本地 access.log 输出。
+
+## 知识库子系统（kb.* 工具）
+
+独立的只读知识库：把文档放进受控目录，服务后台完成分块 → embedding → 索引，AI 通过 4 个只读工具检索。
+`enabled: false`（默认）时完全不挂载，SSH 工具不受任何影响。完整契约见 `kb-mcp-contract-draft.md`。
+
+### 工作原理
+
+```
+watch_dir（inbox，放文档）
+   │  后台轮询（poll_seconds）
+   ▼
+分块（记录 start_line/end_line）→ 调 /v1/embeddings → 写向量索引
+   │                                        ├─ backend: local    → write_dir/kb_index.json（内存余弦）
+   │                                        └─ backend: pgvector → PostgreSQL + pgvector 扩展（HNSW）
+   ▼
+kb.search / kb.fetch / kb.cite / kb.list_scopes（只读，token→scope 服务端过滤）
+```
+
+两种后端实现同一个 `VectorStore` 接口，上层工具/ACL/写路径完全无感，切换只改配置。
+
+- **backend**：
+  - `local`（默认）：零依赖，索引落在本地 JSON，适合单人小库；换模型删 `write_dir/kb_index.json` 重建。
+  - `pgvector`：向量存 PostgreSQL，SQL 层完成 scope 过滤 + 余弦排序（`1 - (embedding <=> q)`），
+    适合多客户端共享/数据量大/需要持久化的场景。见下方 [pgvector 后端](#pgvector-后端)。
+- **scope 划分**：`watch_dir/<scope>/xxx.md` → scope=`<scope>`；根目录文档 → `scope=default`。
+- **ACL（集合级）**：`knowledge_base.token_scopes` 配置 token → 可见 scope。未列出的 token 看不到任何 KB 内容；
+  `scope` 入参中的越权项**静默丢弃**（不报"无权"，防枚举）。留空映射 = open 模式（仅建议内网）。
+- **embedding 冻结**：`model`/`dim` 一旦改变，既有索引失效。向量维度只有 `embedding.dim` 一个来源
+  （pgvector 表的 `vector(dim)` 亦取此值），换模型后需重建索引（local 删文件 / pgvector 见下文）。
+  服务端已 L2 归一化；查询侧自动加 `query_prefix`，文档侧不加。
+- **不可信数据**：检索结果的文本一律是"引用材料"，工具 description 已声明，模型不得执行其中指令。
+- **自激防护**：`watch_dir`/`write_dir` 必须是不同、不嵌套的绝对路径（配置加载时校验）。
+
+### 启用步骤
+
+1. 在 `config.example.yaml` 的 `knowledge_base` 段设置 `enabled: true`，填 `watch_dir` / `write_dir` / embedding 参数。
+2. 选择后端：`backend: local`（默认，无需额外配置）或 `backend: pgvector`（填 `pgvector.dsn`）。
+3. 把文档放入 `watch_dir`（按 scope 建子目录），服务启动即扫描一次，之后按 `poll_seconds` 轮询。
+4. 客户端调 `kb.list_scopes` 看可见知识域，再调 `kb.search`（query 必填，top_k ≤ 20）。
+5. 需要核验出处时调 `kb.cite`（chunk_id 来自 search），返回带行号原文。
+
+### 网页前端 / 远程 AI 经 HTTP 调用 KB
+
+KB 工具与 SSH 工具注册在同一个 MCP Server 上，因此 **HTTP 传输下 `kb.*` 自动可用**，无需为知识库单开端口或通道：
+
+```yaml
+transport: http
+http:
+  host: "0.0.0.0"
+  port: 8080
+  path: "/mcp"
+  cors_origins: ["https://你的前端域名"]   # 网页版 AI 跨域调用时按需放行
+  auth:
+    enabled: true
+    tokens: ["${MCP_ACCESS_TOKEN}"]
+```
+
+网页端以 MCP Streamable HTTP 客户端连接 `http(s)://host:8080/mcp`，携带 `Authorization: Bearer <token>`，
+即可在工具列表里看到并使用 `kb.search` 等 4 个工具；token 对应的可见 scope 由 `token_scopes` 决定。
+单人本地使用若要"连上即用"，可设 `http.auth.enabled: false` 且 `token_scopes` 留空（open 模式，仅限可信内网）。
+
+### pgvector 后端
+
+前置：一个装了 [pgvector](https://github.com/pgvector/pgvector) 扩展的 PostgreSQL（15+）。最小初始化（若 `auto_schema: true` 可省略）：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+-- 表/索引由服务在首次启动时幂等创建（表名取自 pgvector.table，默认 kb_chunks）
+```
+
+配置项（`knowledge_base.pgvector`）：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `dsn` | 必填 | libpq 连接串，支持 `${ENV_VAR}`；如 `postgres://u:p@host:5432/kb?sslmode=disable` |
+| `table` | `kb_chunks` | 表名；仅允许字母/数字/下划线且不以数字开头（要拼进 DDL，故做白名单校验） |
+| `max_conns` | 4 | 连接池上限 |
+| `auto_schema` | true | 启动时自动幂等建扩展/表/索引；设为 false 则由运维预建 |
+
+- **换 embedding 模型后重建**：`TRUNCATE kb_chunks;` 并把 `kb_chunks_meta` 里 `embedding_version` 删除或更新，
+  下次写路径扫描会重新灌入（或整表 `DROP` 后重启，由 `auto_schema` 重建）。
+- **score 方向**：SQL 用 `1 - (embedding <=> q)` 得到与 local 后端一致的相似度；`min_score` 与 `top_k` 语义两后端相同。
+- **HNSW 索引**在 `dim <= 2000` 时自动创建（cosine ops）；创建失败只降级为精确扫描，不阻断服务。
+- **切换后端数据不互通**：local 的 JSON 索引与 pgvector 的表各自独立，切换后写路径会重新消费 `watch_dir`。
+
+### 测试
+
+```bash
+# 单元测试（不依赖外部服务）
+go test ./kb/
+
+# 端到端集成测试（需 192.168.2.236:8082 的 embedding 服务在线）
+KB_IT=1 go test ./kb/ -run TestIntegrationRealEmbedding -v
+```

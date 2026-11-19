@@ -1,6 +1,7 @@
 package sshmcp
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -33,8 +34,29 @@ func BuildCORSOptions(cfg HTTPConfig) []server.CORSOption {
 	return opts
 }
 
+// ContextInjector 把 HTTP 请求里的鉴权信息注入 MCP context。
+// 由宿主（main）提供具体注入逻辑（如 KB 的 token→ctx），sshmcp 库本身不感知业务。
+// 函数签名与 mcp-go 的 server.HTTPContextFunc 一致。
+type ContextInjector func(ctx context.Context, r *http.Request) context.Context
+
+// HTTPServerOption 配置 StartHTTPServer 的可选项（向后兼容：不传则行为不变）。
+type HTTPServerOption func(*httpServerOptions)
+
+type httpServerOptions struct {
+	contextInjector ContextInjector
+}
+
+// WithContextInjector 注入自定义 context 处理器（如把 token 放进 ctx 供工具读取）。
+func WithContextInjector(fn ContextInjector) HTTPServerOption {
+	return func(o *httpServerOptions) { o.contextInjector = fn }
+}
+
 // buildStreamableServer 构造带库内置 CORS 的 Streamable HTTP 服务（不含鉴权）。
-func buildStreamableServer(mcpServer *server.MCPServer, httpCfg HTTPConfig) *server.StreamableHTTPServer {
+func buildStreamableServer(mcpServer *server.MCPServer, httpCfg HTTPConfig, opts ...HTTPServerOption) *server.StreamableHTTPServer {
+	var oo httpServerOptions
+	for _, o := range opts {
+		o(&oo)
+	}
 	path := httpCfg.Path
 	if path == "" {
 		path = "/mcp"
@@ -45,13 +67,16 @@ func buildStreamableServer(mcpServer *server.MCPServer, httpCfg HTTPConfig) *ser
 	if corsOpts := BuildCORSOptions(httpCfg); corsOpts != nil {
 		streamOpts = append(streamOpts, server.WithStreamableHTTPCORS(corsOpts...))
 	}
+	if oo.contextInjector != nil {
+		streamOpts = append(streamOpts, server.WithHTTPContextFunc(server.HTTPContextFunc(oo.contextInjector)))
+	}
 	return server.NewStreamableHTTPServer(mcpServer, streamOpts...)
 }
 
 // BuildHTTPHandler 返回 MCP 端点完整 HTTP 处理链：Streamable 服务（含库内置 CORS）外层包静态令牌鉴权。
 // 宿主程序可直接将返回值注册到任意 *http.ServeMux 的端点路径上。
-func BuildHTTPHandler(mcpServer *server.MCPServer, httpCfg HTTPConfig) http.Handler {
-	streamableSrv := buildStreamableServer(mcpServer, httpCfg)
+func BuildHTTPHandler(mcpServer *server.MCPServer, httpCfg HTTPConfig, opts ...HTTPServerOption) http.Handler {
+	streamableSrv := buildStreamableServer(mcpServer, httpCfg, opts...)
 	if httpCfg.Auth.Enabled {
 		return AuthMiddleware(streamableSrv, httpCfg)
 	}
@@ -218,7 +243,7 @@ func ServeStdio(mcpServer *server.MCPServer) error {
 
 // StartHTTPServer 以 Streamable HTTP 模式启动（支持网页前端 / nginx 反代）。
 // 在 path 暴露 MCP 端点，并额外提供 /health 健康检查。本函数会阻塞监听，一般不会返回（除非监听失败）。
-func StartHTTPServer(mcpServer *server.MCPServer, httpCfg HTTPConfig, serverCount int) error {
+func StartHTTPServer(mcpServer *server.MCPServer, httpCfg HTTPConfig, serverCount int, opts ...HTTPServerOption) error {
 	host := httpCfg.Host
 	if host == "" {
 		host = "0.0.0.0"
@@ -232,7 +257,7 @@ func StartHTTPServer(mcpServer *server.MCPServer, httpCfg HTTPConfig, serverCoun
 		path = "/mcp"
 	}
 
-	handler := BuildHTTPHandler(mcpServer, httpCfg)
+	handler := BuildHTTPHandler(mcpServer, httpCfg, opts...)
 
 	mux := http.NewServeMux()
 	mux.Handle(path, handler)

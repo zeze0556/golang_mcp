@@ -57,6 +57,62 @@ local_read:
   allowed_dirs:
     - "C:/Users/YourName/scripts"   # 仅允许读取这些目录（绝对路径）；为空则启用后也不放行任何路径
 
+# ============================================
+# 知识库子系统（kb.* 工具：kb.search / kb.fetch / kb.cite / kb.list_scopes）
+# ============================================
+# enabled=false（默认）时完全不挂载：不注册 KB 工具、不监听目录，MCP 其余能力不受影响。
+# 设计契约见 kb-mcp-contract-draft.md；retrieved text 一律视为不可信数据。
+knowledge_base:
+  enabled: false
+
+  # 向量存储后端: local（默认，零依赖，索引落本地 JSON）或 pgvector（PostgreSQL + pgvector 扩展）
+  # 两种后端工具/ACL/写路径完全一致，切换只需改这里（数据不互通，切换后重新消费 watch_dir）
+  backend: "local"
+
+  # watch_dir(inbox): 放入待入库文档，服务按 poll_seconds 轮询，按一级子目录划分 scope
+  #   例 watch_dir/billing/refund.md -> scope=billing；watch_dir/notes.md -> scope=default
+  # write_dir(outbox): 索引文件、失败清单(ingest_failures.log)落这里
+  # 硬约束：两者必须是绝对路径、不能相同、不能相互嵌套（防止把产物当新文档自激循环）
+  watch_dir: "D:/knowledge/inbox"
+  write_dir: "D:/knowledge/outbox"
+
+  # 索引文件名（相对 write_dir，仅 backend=local 使用）；切换 embedding 模型/维度需删此文件重建索引
+  index_file: "kb_index.json"
+
+  # pgvector 后端配置（仅 backend=pgvector 时生效）
+  # 向量维度不在此配置：复用上方 embedding.dim（单一真相源，PG 表列 vector(dim) 取同值）
+  pgvector:
+    dsn: "${KB_PG_DSN}"       # libpq 连接串，支持 ${ENV_VAR}；例如 postgres://u:p@127.0.0.1:5432/kb?sslmode=disable
+    table: "kb_chunks"        # 表名，仅允许字母/数字/下划线且不以数字开头
+    max_conns: 4              # 连接池上限
+    auto_schema: true         # 启动时幂等建扩展/表/索引；设为 false 则要求库已由运维预建
+
+  # 分块与检索参数
+  chunk_size: 800          # 每片目标字符数
+  chunk_overlap: 100       # 相邻片重叠字符数
+  top_k_cap: 20            # top_k 硬上限（最大 20）
+  max_char_budget: 12000   # 单次返回字符预算
+  poll_seconds: 30         # 目录轮询间隔（秒）；0 表示仅启动扫描一次
+
+  # embedding 服务（OpenAI 兼容 /v1/embeddings；模型一旦变更，既有索引失效需全量重建）
+  embedding:
+    endpoint: "http://192.168.2.236:8082/v1"   # 到 /v1 为止，不要带 /embeddings
+    model: "Qwen3-Embedding-0.6B"
+    api_key: ""            # 上游无鉴权可留空；支持 ${ENV_VAR}
+    dim: 1024
+    # 查询侧指令前缀（文档侧不加！指令感知模型只在查询侧加）。用 \n 表示换行。
+    query_prefix: "Instruct: 检索知识库文档\nQuery: "
+    timeout_seconds: 60
+
+  # 集合级 ACL：token → 可见 scope 列表（与 http.auth.tokens 中的 token 对应）
+  # 留空 = open 模式（任何持有合法 token 者可见全部 scope，仅建议内网使用）
+  # 配置了映射后：未列出的 token 看不到任何 KB 内容；scope 入参越权项静默丢弃
+  token_scopes:
+    # - token: "${MCP_ACCESS_TOKEN}"
+    #   scopes: ["billing", "hr", "default"]
+    # - token: "another-random-token"
+    #   scopes: ["hr"]
+
 # known_hosts 文件路径（全局）；为空时回退到 ~/.ssh/known_hosts。
 # 仅当所有服务器都未设置 insecure_ignore_host_key 时生效。
 known_hosts_path: ""
