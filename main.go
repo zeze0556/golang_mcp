@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/zeze0556/golang_mcp/kb"
 	sshmcp "github.com/zeze0556/golang_mcp/sshmcp"
 )
 
@@ -50,6 +51,24 @@ func main() {
 		sshmcp.WithAllowAdditionalProperties(cfg.ToolValidation.AllowAdditionalProperties),
 	)
 
+	// 4b. 知识库子系统（独立开关；enabled=false 时不注册任何 KB 工具、不监听目录）
+	var kbSvc *kb.Service
+	httpOpts := []sshmcp.HTTPServerOption{}
+	if cfg.KnowledgeBase.Enabled {
+		var err error
+		kbSvc, err = kb.NewService(cfg.KnowledgeBase, logger)
+		if err != nil {
+			log.Fatalf("知识库初始化失败: %v", err)
+		}
+		defer kbSvc.Close()
+		kb.RegisterTools(mcpServer, kbSvc)
+		// 把 HTTP token 注入 MCP context，供 KB 工具做服务端 ACL（schema 不含 token）
+		httpOpts = append(httpOpts, sshmcp.WithContextInjector(kb.WithToken))
+		fmt.Fprintf(os.Stderr, "  知识库: 已启用（%d chunks）\n", kbSvc.Store().Count())
+	} else {
+		fmt.Fprintln(os.Stderr, "  知识库: 未启用")
+	}
+
 	fmt.Fprintln(os.Stderr, "=================================================")
 	fmt.Fprintln(os.Stderr, "  Multi-SSH MCP Server")
 	fmt.Fprintf(os.Stderr, "  已加载 %d 个服务器配置\n", len(cfg.Servers))
@@ -66,7 +85,7 @@ func main() {
 
 	switch transport {
 	case "http":
-		if err := sshmcp.StartHTTPServer(mcpServer, cfg.HTTP, len(cfg.Servers)); err != nil {
+		if err := sshmcp.StartHTTPServer(mcpServer, cfg.HTTP, len(cfg.Servers), httpOpts...); err != nil {
 			log.Fatalf("MCP Server 运行失败: %v", err)
 		}
 	default:
