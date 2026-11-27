@@ -85,6 +85,26 @@ http:
 - 若只打算给特定前端用，把 `"*"` 换成具体源即可（如 `"http://192.168.2.236:8082"`）。
 - 若经 nginx 反代且由 nginx 统一处理 CORS，可把 `cors_origins` 留空（不启用），由反代层负责跨域。
 
+#### 403 `invalid Host header`（反代场景）
+
+mcp-go 默认开启 localhost/DNS-rebinding 防护：当请求**从 loopback（127.0.0.1）连入**但 `Host` 头不是
+`localhost` 时，返回 `403 Forbidden: invalid Host header "..."`，**token 正确也会失败**（鉴权在更外层先过）。
+经 nginx 反代到 `127.0.0.1:8080` 且 Host 头被透传为外网地址（如 `192.168.199.199`）时就会命中。
+
+两种解法，按推荐顺序：
+
+1. **改 nginx（首选）**：在该 location 加 `proxy_set_header Host localhost;`，让 Host 头变成 loopback 值，然后 `nginx -t && nginx -s reload`。
+2. **改本服务（无法改 nginx 时）**：`config.yaml` 打开开关：
+
+   ```yaml
+   http:
+     allow_nonlocal_host: true   # 关闭 localhost/DNS-rebinding Host 校验，默认 false
+   ```
+
+   启动日志会打印 `Host 校验: 已关闭 ...` 供确认。注意：鉴权中间件仍在 Host 校验外层，
+   关掉 Host 校验**不会**绕过 token 鉴权；但 DNS rebinding 防护也随之关闭，请确保鉴权/网络层已限制来源。
+   Streamable HTTP 与 SSE 走同一 handler，此开关对两者同时生效。
+
 #### 访问令牌鉴权（推荐公网 / 反代暴露时开启）
 
 开启后，任何对 `/mcp` 的调用都必须携带合法 `access_token`，否则返回 `401`。这能防止

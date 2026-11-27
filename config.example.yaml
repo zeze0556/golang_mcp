@@ -22,6 +22,13 @@ http:
   # 纯匿名调用可设为 false。无论 true/false，"*" 都会正确回显来源，浏览器均可接受。
   cors_credentials: true   # 是否允许跨域携带凭证（如 Cookie / Authorization）
 
+  # 关闭 mcp-go 的 localhost/DNS-rebinding Host 校验（默认 false，保持库安全语义）
+  # 症状：nginx 反代到 127.0.0.1:8080，但 Host 头透传为外网地址时，
+  #       带正确 token 仍报 403 Forbidden: invalid Host header "x.x.x.x"
+  # 首选在 nginx 用 proxy_set_header Host localhost; 修正；只有无法改 nginx 时才开此开关。
+  # 开启前请确认鉴权/网络层已限制来源（鉴权中间件仍在 Host 校验外层，不受影响）。
+  allow_nonlocal_host: false
+
   # 访问令牌鉴权（防止 MCP 端点被未授权访问，建议公网/反代暴露时务必开启）
   # 客户端调用时需携带：Authorization: Bearer <token>  或  X-Access-Token: <token>
   auth:

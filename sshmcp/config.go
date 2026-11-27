@@ -63,6 +63,10 @@ type HTTPConfig struct {
 	CORSOrigins     []string   `yaml:"cors_origins,omitempty"`     // 允许跨域的源（网页前端）
 	CORSCredentials bool       `yaml:"cors_credentials,omitempty"` // 是否允许携带凭证
 	Auth            AuthConfig `yaml:"auth,omitempty"`             // 访问令牌鉴权
+	// AllowNonlocalHost 关闭 mcp-go 的 localhost/DNS-rebinding 防护（WithDisableLocalhostProtection）。
+	// 默认 false 保持库安全语义。仅在「反代到 127.0.0.1 但 Host 头为外网地址」且无法在 nginx 改写 Host 时开启。
+	// 开启前请确保鉴权/网络层已限制访问来源，否则会暴露 DNS rebinding 攻击面。
+	AllowNonlocalHost bool `yaml:"allow_nonlocal_host,omitempty"`
 }
 
 // KBEmbeddingConfig 知识库 embedding 服务配置（OpenAI 兼容 /v1/embeddings）。
