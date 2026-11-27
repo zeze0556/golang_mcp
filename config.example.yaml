@@ -22,6 +22,13 @@ http:
   # 纯匿名调用可设为 false。无论 true/false，"*" 都会正确回显来源，浏览器均可接受。
   cors_credentials: true   # 是否允许跨域携带凭证（如 Cookie / Authorization）
 
+  # 关闭 mcp-go 的 localhost/DNS-rebinding Host 校验（默认 false，保持库安全语义）
+  # 症状：nginx 反代到 127.0.0.1:8080，但 Host 头透传为外网地址时，
+  #       带正确 token 仍报 403 Forbidden: invalid Host header "x.x.x.x"
+  # 首选在 nginx 用 proxy_set_header Host localhost; 修正；只有无法改 nginx 时才开此开关。
+  # 开启前请确认鉴权/网络层已限制来源（鉴权中间件仍在 Host 校验外层，不受影响）。
+  allow_nonlocal_host: false
+
   # 访问令牌鉴权（防止 MCP 端点被未授权访问，建议公网/反代暴露时务必开启）
   # 客户端调用时需携带：Authorization: Bearer <token>  或  X-Access-Token: <token>
   auth:
@@ -71,8 +78,12 @@ knowledge_base:
 
   # watch_dir(inbox): 放入待入库文档，服务按 poll_seconds 轮询，按一级子目录划分 scope
   #   例 watch_dir/billing/refund.md -> scope=billing；watch_dir/notes.md -> scope=default
-  # write_dir(outbox): 索引文件、失败清单(ingest_failures.log)落这里
+  # write_dir(outbox): 索引文件、失败清单(ingest_failures.log)、去重缓存(kb_ingest_state.json)落这里
   # 硬约束：两者必须是绝对路径、不能相同、不能相互嵌套（防止把产物当新文档自激循环）
+  #
+  # 启动与缓存：文档扫描/embedding 在后台执行，启动不阻塞；kb_ingest_state.json 记录每个文档的
+  # 内容 sha256，未变更的文档跳过 embedding。换 embedding 模型/维度、state 损坏、或索引与 state
+  # 不一致时自动全量重建。想强制全量重建：删除 index_file 与 kb_ingest_state.json。
   watch_dir: "D:/knowledge/inbox"
   write_dir: "D:/knowledge/outbox"
 
@@ -92,7 +103,7 @@ knowledge_base:
   chunk_overlap: 100       # 相邻片重叠字符数
   top_k_cap: 20            # top_k 硬上限（最大 20）
   max_char_budget: 12000   # 单次返回字符预算
-  poll_seconds: 30         # 目录轮询间隔（秒）；0 表示仅启动扫描一次
+  poll_seconds: 30         # 后台目录轮询间隔（秒）；0 表示只在启动时后台扫描一次
 
   # embedding 服务（OpenAI 兼容 /v1/embeddings；模型一旦变更，既有索引失效需全量重建）
   embedding:

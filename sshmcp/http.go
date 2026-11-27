@@ -64,6 +64,11 @@ func buildStreamableServer(mcpServer *server.MCPServer, httpCfg HTTPConfig, opts
 	streamOpts := []server.StreamableHTTPOption{
 		server.WithEndpointPath(path),
 	}
+	// mcp-go 默认开启 localhost/DNS-rebinding 防护：从 loopback 连接进来但 Host 头非 localhost 时返回 403。
+	// 反代场景（nginx → 127.0.0.1:8080，Host 头为外网地址）会误报；显式开启此开关才关闭防护。
+	if httpCfg.AllowNonlocalHost {
+		streamOpts = append(streamOpts, server.WithDisableLocalhostProtection(true))
+	}
 	if corsOpts := BuildCORSOptions(httpCfg); corsOpts != nil {
 		streamOpts = append(streamOpts, server.WithStreamableHTTPCORS(corsOpts...))
 	}
@@ -283,6 +288,9 @@ func StartHTTPServer(mcpServer *server.MCPServer, httpCfg HTTPConfig, serverCoun
 		fmt.Fprintf(os.Stderr, "  鉴权: 已启用（需携带 access_token，共 %d 个合法令牌）\n", len(resolveAuthTokens(httpCfg.Auth)))
 	} else {
 		fmt.Fprintln(os.Stderr, "  鉴权: 未启用（任何能访问端口者均可调用，建议内网/反代层再加保护）")
+	}
+	if httpCfg.AllowNonlocalHost {
+		fmt.Fprintln(os.Stderr, "  Host 校验: 已关闭 localhost/DNS-rebinding 防护（allow_nonlocal_host=true）")
 	}
 	fmt.Fprintln(os.Stderr, "=================================================")
 

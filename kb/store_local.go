@@ -229,4 +229,11 @@ func (s *LocalStore) SetEmbeddingVersion(v string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.embVer = v
+	// 必须落盘：换 embedding 模型后服务会重写版本，若只改内存，
+	// 进程重启时版本回退到旧值，tools.go 的版本校验会永久拒绝查询。
+	if err := s.persist(); err != nil {
+		// SetEmbeddingVersion 无返回值，错误通过下次查询的版本校验兜底暴露。
+		// 用 stderr 直出避免引入 logger 依赖（此包其余持久错误已走日志，但此处签名是既有接口）。
+		fmt.Fprintf(os.Stderr, "kb.store: 持久化 embedding 版本失败: %v\n", err)
+	}
 }

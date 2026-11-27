@@ -85,6 +85,26 @@ http:
 - 若只打算给特定前端用，把 `"*"` 换成具体源即可（如 `"http://192.168.2.236:8082"`）。
 - 若经 nginx 反代且由 nginx 统一处理 CORS，可把 `cors_origins` 留空（不启用），由反代层负责跨域。
 
+#### 403 `invalid Host header`（反代场景）
+
+mcp-go 默认开启 localhost/DNS-rebinding 防护：当请求**从 loopback（127.0.0.1）连入**但 `Host` 头不是
+`localhost` 时，返回 `403 Forbidden: invalid Host header "..."`，**token 正确也会失败**（鉴权在更外层先过）。
+经 nginx 反代到 `127.0.0.1:8080` 且 Host 头被透传为外网地址（如 `192.168.199.199`）时就会命中。
+
+两种解法，按推荐顺序：
+
+1. **改 nginx（首选）**：在该 location 加 `proxy_set_header Host localhost;`，让 Host 头变成 loopback 值，然后 `nginx -t && nginx -s reload`。
+2. **改本服务（无法改 nginx 时）**：`config.yaml` 打开开关：
+
+   ```yaml
+   http:
+     allow_nonlocal_host: true   # 关闭 localhost/DNS-rebinding Host 校验，默认 false
+   ```
+
+   启动日志会打印 `Host 校验: 已关闭 ...` 供确认。注意：鉴权中间件仍在 Host 校验外层，
+   关掉 Host 校验**不会**绕过 token 鉴权；但 DNS rebinding 防护也随之关闭，请确保鉴权/网络层已限制来源。
+   Streamable HTTP 与 SSE 走同一 handler，此开关对两者同时生效。
+
 #### 访问令牌鉴权（推荐公网 / 反代暴露时开启）
 
 开启后，任何对 `/mcp` 的调用都必须携带合法 `access_token`，否则返回 `401`。这能防止
@@ -226,17 +246,26 @@ sudo fail2ban-client banned mcp-auth
 ### 工作原理
 
 ```
+启动 → NewService 立即返回（不扫文档）→ 后台 goroutine 首轮扫描 + 按 poll_seconds 轮询
+   │
 watch_dir（inbox，放文档）
-   │  后台轮询（poll_seconds）
-   ▼
-分块（记录 start_line/end_line）→ 调 /v1/embeddings → 写向量索引
-   │                                        ├─ backend: local    → write_dir/kb_index.json（内存余弦）
-   │                                        └─ backend: pgvector → PostgreSQL + pgvector 扩展（HNSW）
+   │  逐篇读内容算 sha256 → 查去重缓存
+   │      ├─ hash 命中 → 跳过（不调 embedding）
+   │      └─ 新增/变更 → 分块（记录 start_line/end_line）→ 调 /v1/embeddings → 写向量索引
+   │                                                          ├─ local    → write_dir/kb_index.json
+   │                                                          └─ pgvector → PostgreSQL + pgvector（HNSW）
+   │  成功后把 docID→hash 落盘 write_dir/kb_ingest_state.json（原子写）
    ▼
 kb.search / kb.fetch / kb.cite / kb.list_scopes（只读，token→scope 服务端过滤）
 ```
 
 两种后端实现同一个 `VectorStore` 接口，上层工具/ACL/写路径完全无感，切换只改配置。
+
+**启动不阻塞 / 去重缓存**：文档扫描与 embedding 全在后台 goroutine 执行，服务启动与文档数量无关。
+每个文档的内容 sha256 持久化在 `write_dir/kb_ingest_state.json`，下次启动（或下一轮轮询）命中即跳过，
+不重复调用 embedding。缓存整体失效的条件：embedding 模型/维度变更、state 文件损坏、
+或 state 与向量索引不一致（比如删了索引文件）——任一触发即全量重建，宁可多算也不漏检。
+全量命中缓存的空轮询不产生磁盘写。
 
 - **backend**：
   - `local`（默认）：零依赖，索引落在本地 JSON，适合单人小库；换模型删 `write_dir/kb_index.json` 重建。
@@ -245,8 +274,8 @@ kb.search / kb.fetch / kb.cite / kb.list_scopes（只读，token→scope 服务�
 - **scope 划分**：`watch_dir/<scope>/xxx.md` → scope=`<scope>`；根目录文档 → `scope=default`。
 - **ACL（集合级）**：`knowledge_base.token_scopes` 配置 token → 可见 scope。未列出的 token 看不到任何 KB 内容；
   `scope` 入参中的越权项**静默丢弃**（不报"无权"，防枚举）。留空映射 = open 模式（仅建议内网）。
-- **embedding 冻结**：`model`/`dim` 一旦改变，既有索引失效。向量维度只有 `embedding.dim` 一个来源
-  （pgvector 表的 `vector(dim)` 亦取此值），换模型后需重建索引（local 删文件 / pgvector 见下文）。
+- **embedding 冻结**：`model`/`dim` 一旦改变，去重缓存自动失效并由后台全量重建（无需手动删索引）。
+  向量维度只有 `embedding.dim` 一个来源（pgvector 表的 `vector(dim)` 亦取此值）。
   服务端已 L2 归一化；查询侧自动加 `query_prefix`，文档侧不加。
 - **不可信数据**：检索结果的文本一律是"引用材料"，工具 description 已声明，模型不得执行其中指令。
 - **自激防护**：`watch_dir`/`write_dir` 必须是不同、不嵌套的绝对路径（配置加载时校验）。
@@ -255,7 +284,8 @@ kb.search / kb.fetch / kb.cite / kb.list_scopes（只读，token→scope 服务�
 
 1. 在 `config.example.yaml` 的 `knowledge_base` 段设置 `enabled: true`，填 `watch_dir` / `write_dir` / embedding 参数。
 2. 选择后端：`backend: local`（默认，无需额外配置）或 `backend: pgvector`（填 `pgvector.dsn`）。
-3. 把文档放入 `watch_dir`（按 scope 建子目录），服务启动即扫描一次，之后按 `poll_seconds` 轮询。
+3. 把文档放入 `watch_dir`（按 scope 建子目录），服务**启动后立即返回**，首轮扫描在后台进行，
+   之后按 `poll_seconds` 轮询；刚启动时索引可能为空，稍候即就绪。进度看日志 `kb.ingest.doc_ok` / `kb.ingest.state_loaded`。
 4. 客户端调 `kb.list_scopes` 看可见知识域，再调 `kb.search`（query 必填，top_k ≤ 20）。
 5. 需要核验出处时调 `kb.cite`（chunk_id 来自 search），返回带行号原文。
 
