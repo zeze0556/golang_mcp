@@ -71,8 +71,12 @@ knowledge_base:
 
   # watch_dir(inbox): 放入待入库文档，服务按 poll_seconds 轮询，按一级子目录划分 scope
   #   例 watch_dir/billing/refund.md -> scope=billing；watch_dir/notes.md -> scope=default
-  # write_dir(outbox): 索引文件、失败清单(ingest_failures.log)落这里
+  # write_dir(outbox): 索引文件、失败清单(ingest_failures.log)、去重缓存(kb_ingest_state.json)落这里
   # 硬约束：两者必须是绝对路径、不能相同、不能相互嵌套（防止把产物当新文档自激循环）
+  #
+  # 启动与缓存：文档扫描/embedding 在后台执行，启动不阻塞；kb_ingest_state.json 记录每个文档的
+  # 内容 sha256，未变更的文档跳过 embedding。换 embedding 模型/维度、state 损坏、或索引与 state
+  # 不一致时自动全量重建。想强制全量重建：删除 index_file 与 kb_ingest_state.json。
   watch_dir: "D:/knowledge/inbox"
   write_dir: "D:/knowledge/outbox"
 
@@ -92,7 +96,7 @@ knowledge_base:
   chunk_overlap: 100       # 相邻片重叠字符数
   top_k_cap: 20            # top_k 硬上限（最大 20）
   max_char_budget: 12000   # 单次返回字符预算
-  poll_seconds: 30         # 目录轮询间隔（秒）；0 表示仅启动扫描一次
+  poll_seconds: 30         # 后台目录轮询间隔（秒）；0 表示只在启动时后台扫描一次
 
   # embedding 服务（OpenAI 兼容 /v1/embeddings；模型一旦变更，既有索引失效需全量重建）
   embedding:

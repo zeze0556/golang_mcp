@@ -67,13 +67,17 @@ func NewService(cfg sshmcp.KnowledgeBaseConfig, logger *slog.Logger) (*Service, 
 		storeDesc = indexPath
 	}
 
-	// embedding 版本绑定：空则写入；不匹配则拒绝查询（查询时校验）。两种后端通用。
+	// embedding 版本绑定。两种后端通用。
+	// 版本不匹配 = 换过模型：旧向量不可复用。重写为新版本并让写路径全量重建：
+	// Ingestor.loadState 检测到版本变化会丢弃 hash 缓存，后台首轮扫描即重建全部文档。
+	// 重建完成前 tools.go 不会拒绝查询（版本已对齐），只是召回旧向量——这是可接受的过渡态。
 	ver := emb.Version()
-	if cur := store.EmbeddingVersion(); cur == "" {
+	if cur := store.EmbeddingVersion(); cur != ver {
+		if cur != "" {
+			logger.Warn("kb.embed_version_mismatch",
+				"index", cur, "current", ver, "hint", "后台将按当前模型全量重建索引")
+		}
 		store.SetEmbeddingVersion(ver)
-	} else if cur != ver {
-		logger.Warn("kb.embed_version_mismatch",
-			"index", cur, "current", ver, "hint", "rebuild index via watch_dir")
 	}
 
 	// ACL resolver：把 sshmcp 配置类型转成 kb 中性类型
